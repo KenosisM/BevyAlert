@@ -1,0 +1,15 @@
+# 编译产物
+/target
+
+# 游戏资产（EA / Westwood 版权，不入库）
+/assets
+
+# 本地草稿、一次性脚本、调试导出
+/_scratch
+/其他
+*.png
+*.log
+/_*.txt
+
+# 会话记忆
+/.workbuddy
