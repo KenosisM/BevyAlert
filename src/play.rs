@@ -96,6 +96,7 @@ fn issue_orders_inner(world:&mut World,requests:&[(Vec<Entity>,Cell)])->Vec<Orde
             u.parking=Some(target);u.command_id=Some(command);u.guide=Some(plan.guide.clone());
             u.contact_hold=false;
             u.arrival.accept();
+            u.preferred_velocity=None;
             u.start_delay=0.0;u.ap_budget=ap_budget;u.stall_ticks=0;u.still_ticks=0;u.escape_ticks=0;u.turret_idle=false;
             if u.path.len()!=2 {u.path.clear();u.leg_t=0.0;}
             staged.claims.get_mut(&id).unwrap().command=command.0;
@@ -115,6 +116,7 @@ pub fn cancel_selected(world:&mut World)->usize {
             ids.insert(u.idx);u.goal=Cell::new(-1,-1);u.command_id=None;u.parking=None;u.guide=None;
             u.contact_hold=false;
             u.arrival.cancel();
+            u.preferred_velocity=None;
             u.path.clear();u.leg_t=0.0;u.vx=0.0;u.vy=0.0;u.stall_ticks=0;u.escape_ticks=0;
         }
     }
@@ -125,7 +127,7 @@ pub fn cancel_selected(world:&mut World)->usize {
 pub fn stop_selected(world:&mut World)->usize {
     let selected=world.resource::<Selection>().0.clone();let mut ids=BTreeSet::new();
     for e in selected {if let Some(mut u)=world.get_mut::<Unit>(e) {if u.command_id.is_some()&&u.parking.is_some()&&ids.insert(u.idx) {
-        u.arrival.stop();u.vx=0.0;u.vy=0.0;
+        u.arrival.stop();u.vx=0.0;u.vy=0.0;u.preferred_velocity=None;
     }}}ids.len()
 }
 pub fn wake_selected(world:&mut World,reason:crate::arrival::WakeReason)->usize {

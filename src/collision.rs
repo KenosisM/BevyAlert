@@ -453,7 +453,7 @@ mod tests {
         }
     }
     #[test]
-    fn formal_simulation_keeps_the_reason_for_a_wall_limited_velocity_proposal() {
+    fn formal_simulation_predicts_a_wall_and_retains_contact_fallback_diagnostics() {
         use crate::{simulation,world::{SimEnv,Unit},nav::Cell};
         let mut g=grid(20,20);for y in 0..20 {g.cost[y*20+8]=0;}
         let mut env=SimEnv{nav:g,..Default::default()};
@@ -461,8 +461,9 @@ mod tests {
         let mut reported=false;
         for _ in 0..20 {
             simulation::step_continuous(&mut env,&mut units);
-            reported |= env.runtime.contacts.reasons[0]==Blocked::StaticBoundary;
+            reported |= env.runtime.orca.static_constraints>0;
             assert_eq!(env.runtime.contacts.illegal_static_trajectories,0);
+            assert_eq!(env.runtime.orca.contact_fallback,0);
         }
         assert!(reported);assert!(units[0].cell_x<7.05001);assert_eq!(units[0].goal,Cell::new(15,10));
     }

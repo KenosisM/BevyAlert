@@ -33,7 +33,8 @@ pub fn initial_state(seed: u64, hz: f64) -> (SimEnv, Vec<Unit>) {
         guide: Some(field.clone()),
         ..Default::default()
     }).collect();
-    (SimEnv { nav, runtime, ..Default::default() }, units)
+    // Retained explicitly as the historical pre-reservation steering fixture.
+    (SimEnv { nav, runtime, velocity_mode:crate::crowd::VelocityMode::Legacy, ..Default::default() }, units)
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {

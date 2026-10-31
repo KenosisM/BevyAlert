@@ -1,7 +1,7 @@
 //! Fixed-step continuous simulation shared by ECS and asset-free headless runs.
 //!
 //! Unit and SimEnv are data at this boundary; this module never queries ECS.
-//! Legacy steering proposes motion; collision checks constrain the committed trajectories.
+//! ORCA selects velocities; continuous collision checks verify the committed trajectories.
 
 use std::time::{Duration, Instant};
 use crate::crowd;
@@ -16,6 +16,9 @@ pub struct Buffers {
     pub idle_bodies:Vec<crate::formation::Body>,pub idle_index:crate::spatial::Index,
     pub idle_bounds:Vec<crate::spatial::Aabb>,pub idle_neighbors:Vec<usize>,
     pub local_routes:crate::local_nav::Routes,
+    pub orca:crowd::OrcaWorkspace,
+    proposals:Vec<bevy::math::Vec2>,
+    objectives:Vec<bevy::math::Vec2>,caps:Vec<f32>,
     bounds:Vec<crate::spatial::Aabb>,neighbors:Vec<usize>,
 }
 
@@ -74,6 +77,7 @@ pub struct Runtime {
     /// Last completed contact check, including conservative stops and unresolved initial overlaps.
     pub contacts: crate::collision::ContactReport,
     pub spatial_stats: crate::spatial::Stats,
+    pub orca:crowd::OrcaReport,
 }
 
 impl Default for Runtime {
@@ -86,7 +90,7 @@ impl Runtime {
         let fixed_step = Duration::from_secs_f64(1.0 / hz);
         assert!(!fixed_step.is_zero(), "simulation timestep must be nonzero");
         Self { fixed_step, seed, next_command: 1, sample_every: 0, last_sample: None,
-            contacts: crate::collision::ContactReport::default(),spatial_stats:crate::spatial::Stats::default() }
+            contacts: crate::collision::ContactReport::default(),spatial_stats:crate::spatial::Stats::default(),orca:crowd::OrcaReport::default() }
     }
     pub fn fixed_step(&self) -> Duration { self.fixed_step }
     pub fn dt(&self) -> f32 { self.fixed_step.as_secs_f32() }
@@ -110,10 +114,13 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     }}
     let formation_time=total.elapsed();
     let dt = env.runtime.dt();
+    let orca=env.velocity_mode==crowd::VelocityMode::Orca;
+    env.runtime.orca=crowd::OrcaReport::default();
     let phase = Instant::now();
     // ---- 1. 快照：位置 / 路权 / 半径 ----------------------------------------
     let mut buffers=std::mem::take(&mut env.buffers);
     buffers.velocity_index.begin_tick();buffers.contacts.begin_tick();
+    if orca {buffers.orca.boundaries.refresh(&env.nav);}
     let agents=&mut buffers.agents;agents.clear();agents.reserve(units.len());
     for u in units.iter() {
         // 路权：离自己那一格越近越优先（用场的剩余距离；没有场就用欧氏距离）
@@ -152,15 +159,15 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
 
     buffers.bounds.clear();buffers.bounds.extend(agents.iter().map(|a|crate::spatial::Aabb::point(bevy::math::Vec2::new(a.x,a.y))));
     buffers.velocity_index.rebuild(&buffers.bounds);
-    let max_speed=agents.iter().map(|a|a.speed.abs()).fold(0.0f32,f32::max);
+    let max_speed=agents.iter().map(|a|a.speed.abs().max(a.vx.hypot(a.vy))).fold(0.0f32,f32::max);
     let max_radius=agents.iter().map(|a|a.radius).fold(0.0f32,f32::max);
 
     let snapshot_time = phase.elapsed();
     let phase = Instant::now();
 
     // ---- 2. 压力场：每 4 tick 重建一次（低频，避免抖动）--------------------
-    env.since_pressure += 1;
-    if env.since_pressure >= 4 || env.pressure.field.is_empty() {
+    if !orca {env.since_pressure += 1;}
+    if !orca&&(env.since_pressure >= 4 || env.pressure.field.is_empty()) {
         env.pressure.rebuild(&env.nav, &agents);
         env.since_pressure = 0;
     }
@@ -170,6 +177,8 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
 
     // ---- 3. 速度层：算出每辆车的期望速度，把位置先推到快照里 ----------------
     buffers.snapshot.clear();buffers.snapshot.extend_from_slice(agents);let snapshot=&buffers.snapshot;
+    buffers.objectives.clear();buffers.objectives.resize(units.len(),bevy::math::Vec2::ZERO);
+    buffers.caps.clear();buffers.caps.resize(units.len(),0.0);
     let dt_safe = dt.max(1e-4);
     for (i, u) in units.iter_mut().enumerate() {
         if !u.on_ground || u.goal.x < 0 || agents[i].settled {
@@ -181,17 +190,23 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         let local=crate::formation::direction(u,bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),env.tick,&mut query,&mut buffers.local_routes);
         let mut dir = if let Some(v)=local {(v.x,v.y)}else{long_range_dir(&env.nav,u,&snapshot[i],goal)};
         // 保留原有切向逃逸，直到显式停滞恢复接管。
-        if u.escape_ticks > 0&&!u.parking.as_ref().is_some_and(|t|t.local_active) {
+        if !orca&&u.escape_ticks > 0&&!u.parking.as_ref().is_some_and(|t|t.local_active) {
             dir = crowd::rotate90(dir, u.escape_side);
         }
-        let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,
-            dt,env.crowd_params.neighbor_radius.max(1.2));
-        buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
+        if !orca {
+            let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,dt,env.crowd_params.neighbor_radius.max(1.2));
+            buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
+        }
         let goal=crate::formation::motion_goal(u);let goal=(goal.x,goal.y);
         let preferred=if let Some(t)=&u.parking {
             let remaining=t.remaining_distance(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),bevy::math::Vec2::new(goal.0,goal.1));
             Some(u.arrival.preferred_speed(t,remaining,u.speed,agents[i].max_accel,dt))
         }else{None};
+        if orca {
+            let cap=preferred.unwrap_or(u.speed).min(u.speed).max(0.0);
+            buffers.objectives[i]=bevy::math::Vec2::new(dir.0,dir.1).normalize_or_zero()*cap;
+            buffers.caps[i]=cap;continue;
+        }
         let mut steering_params=env.crowd_params;
         if u.parking.is_some() {
             steering_params.arrive_radius=crate::formation::POINT_REACH_RADIUS;
@@ -216,15 +231,31 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         agents[i].x = from.0+vx*dt;
         agents[i].y = from.1+vy*dt;
     }
+    if orca {for (i,u) in units.iter_mut().enumerate() {
+        if !u.on_ground||u.goal.x<0||snapshot[i].settled {continue;}
+        let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,
+            crowd::AGENT_HORIZON,env.crowd_params.neighbor_radius.max(1.2));
+        buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
+        let wanted=crowd::passing_preference(i,snapshot,&buffers.neighbors,&buffers.objectives);
+        let objective=crowd::smooth_preferred(u.preferred_velocity,wanted,snapshot[i].max_accel,dt,buffers.caps[i]);
+        u.preferred_velocity=Some(objective);
+        let v=buffers.orca.velocity(i,snapshot,&buffers.neighbors,objective,buffers.caps[i],dt,&mut env.runtime.orca);
+        agents[i].x=snapshot[i].x+v.x*dt;agents[i].y=snapshot[i].y+v.y*dt;
+    }}
 
     let velocity_time = phase.elapsed();
     let phase = Instant::now();
 
-    // ---- 4. 位置修正层：把重叠的圆盘直接推开 --------------------------------
-    // 速度层只能把稳态压到「软重叠」——期望速度一直在往里顶。这一层是硬约束。
+    // ---- 4. Verify whole trajectories; keep contact correction as a reported fallback.
+    buffers.proposals.clear();buffers.proposals.extend(agents.iter().map(|a|bevy::math::Vec2::new(a.x,a.y)));
     crate::collision::finish_motion_with_workspace(snapshot,agents,&env.nav,&mut buffers.contacts,&mut env.runtime.contacts);
+    if orca {env.runtime.orca.contact_fallback=agents.iter().zip(&buffers.proposals).enumerate()
+        .filter(|(i,(a,p))|env.runtime.contacts.reasons[*i]!=crate::collision::Blocked::None
+            ||bevy::math::Vec2::new(a.x,a.y).distance_squared(**p)>1e-8).count();}
     let mut spatial_stats=buffers.velocity_index.stats.clone();
     spatial_stats.merge(&buffers.idle_index.stats);
+    if orca {spatial_stats.merge(&buffers.orca.boundaries.index.stats);}
+    env.runtime.orca.truncated=spatial_stats.truncated;
     spatial_stats.merge(&buffers.contacts.projection_index.stats);spatial_stats.merge(&buffers.contacts.trajectory_index.stats);
     env.runtime.spatial_stats=spatial_stats;
 
@@ -275,7 +306,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         if u.escape_ticks > 0 {
             u.escape_ticks -= 1;
         }
-        if u.stall_ticks > 30 && u.escape_ticks == 0 {
+        if !orca&&u.stall_ticks > 30 && u.escape_ticks == 0 {
             u.escape_ticks = 20;
             u.escape_side = if (u.idx % 2) == 0 { 1.0 } else { -1.0 };
             u.stall_ticks = 0;

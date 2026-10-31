@@ -837,6 +837,7 @@ pub fn run(args: Vec<String>) {
         // ⚠️ 暂时回到旧的离散重力碗：新的连续运动层还没在真实地图上验过，
         // 已知问题：脚本指令下单位可能不动。改 true 就切回新系统。
         use_crowd: cfg.crowd,
+        velocity_mode: crate::crowd::VelocityMode::Orca,
         pressure: crate::crowd::Pressure::default(),
         crowd_params: crate::crowd::Params::default(),
         since_pressure: 0,

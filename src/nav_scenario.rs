@@ -61,7 +61,7 @@ impl SceneConfig {
         if self.sample_every == 0 { return Err("sample interval must be positive".into()); }
         Ok(())
     }
-    pub fn mode(&self) -> &'static str { if self.continuous { "continuous-legacy" } else { "discrete-legacy" } }
+    pub fn mode(&self) -> &'static str { if self.continuous { "continuous-orca" } else { "discrete-legacy" } }
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = fs::read_to_string(path).map_err(|e| format!("cannot read scenario: {e}"))?;
         Self::decode(&text)
@@ -200,6 +200,7 @@ pub struct Metrics {
     pub planning_us:u128,pub formation_us:u128,
     pub entry_refinements:u64,
     pub arrived:Option<usize>,pub arriving:usize,pub waiting:[usize;4],pub replanning:usize,pub failed:usize,pub max_parked_drift:f32,
+    pub orca:crate::crowd::OrcaReport,
 }
 impl Metrics {
     pub fn arrival_text(&self)->String {self.arrived.map_or("not-ready".into(),|v|v.to_string())}
@@ -213,6 +214,7 @@ pub fn metrics(world:&mut World) -> Metrics {
     let mut m=Metrics { tick:env.tick,..default() };
     let contacts=&env.runtime.contacts;
     m.spatial=env.runtime.spatial_stats.clone();
+    m.orca=env.runtime.orca.clone();
     m.reserved=env.reservations.claims.len();m.planning_us=env.reservations.planning_time.as_micros();
     m.entry_refinements=env.reservations.entry_refinements;
     m.collision_ready=env.use_crowd&&env.tick>0;
@@ -263,7 +265,7 @@ pub fn metrics(world:&mut World) -> Metrics {
 pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path:&Path) -> Result<(),String> {
     use std::fmt::Write;
     if let Some(parent)=path.parent().filter(|p|!p.as_os_str().is_empty()) { fs::create_dir_all(parent).map_err(|e|e.to_string())?; }
-    let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops,spatial_us,neighbor_peak,bucket_peak,neighbor_queries,neighbor_entries,pair_candidates,neighbor_truncated,dense_bucket_events,large_bounds,fallback_queries,reservation_count,frozen_targets,waiting_space,waiting_entrance,blocked_near_path,command_plan_us,formation_us,entry_refinements,arriving,stopped,replanning,failed,max_parked_drift\n");
+    let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops,spatial_us,neighbor_peak,bucket_peak,neighbor_queries,neighbor_entries,pair_candidates,neighbor_truncated,dense_bucket_events,large_bounds,fallback_queries,reservation_count,frozen_targets,waiting_space,waiting_entrance,blocked_near_path,command_plan_us,formation_us,entry_refinements,arriving,stopped,replanning,failed,max_parked_drift,orca_solved,orca_infeasible,orca_invalid,orca_emergency,orca_static_constraints,orca_unit_constraints,orca_full_responsibility,orca_neighbor_truncated,orca_contact_fallback,orca_max_violation\n");
     for m in samples {
         let timing=|v:u128|if m.timing_ready {v.to_string()} else {"not-ready".into()};
         let contacts=if m.collision_ready {format!("{:.6},{},{},{},{},{}",m.swept_penetration,
@@ -274,7 +276,9 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
             s.peak_bucket,s.queries,s.visited_entries,s.candidate_pairs,s.truncated,s.dense_bucket_events,s.large_bounds,s.fallback_queries)}
             else {"not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready".into()};
         let formation=format!("{},{},{},{},{},{},{},{}",m.reserved,m.frozen_targets,m.waiting_space,m.waiting_entrance,m.blocked_near,m.planning_us,timing(m.formation_us),m.entry_refinements);
-        let arrival=format!("{},{},{},{},{:.9}",m.arriving,m.waiting[0],m.replanning,m.failed,m.max_parked_drift);
+        let o=&m.orca;
+        let arrival=format!("{},{},{},{},{:.9},{},{},{},{},{},{},{},{},{},{:.9}",m.arriving,m.waiting[0],m.replanning,m.failed,m.max_parked_drift,
+            o.solved,o.infeasible,o.invalid,o.emergency,o.static_constraints,o.unit_constraints,o.full_responsibility,o.truncated,o.contact_fallback,o.max_violation);
         writeln!(csv,"{},{:.6},{},{},{},{},{},{:.6},{:.6},{},{},{},{},{},{},{},{:016x},{},{},{},{},{}",
             m.tick,m.tick as f64/TICK_HZ,m.active,m.moved,m.arrival_text(),m.waiting_text(),m.legacy_stalled,m.max_still_seconds,m.overlap_end,
             m.bad_centers,timing(m.total_us),timing(m.snapshot_us),timing(m.pressure_us),timing(m.velocity_us),timing(m.contact_us),timing(m.writeback_us),m.digest,

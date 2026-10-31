@@ -1,6 +1,6 @@
 //! Near parking routes reuse nav's graph solver and collision's physical predicates.
 //! A half-spacing roadmap represents the free lanes between fractional parking slots.
-use std::collections::{BTreeMap,BTreeSet};
+use std::collections::{BTreeMap,BTreeSet,VecDeque};
 use bevy::math::Vec2;
 use crate::{collision,formation::{Body,Target,PARKING_SPACING},nav::{self,Cell,CostGrid},spatial::{Aabb,Index}};
 
@@ -80,7 +80,24 @@ fn endpoints(g:&CostGrid,origin:Vec2,step:f32,p:Vec2,q:&mut Query<'_>)->Vec<Cell
 fn search(g:&CostGrid,origin:Vec2,step:f32,from:Vec2,goal:Vec2,q:&mut Query<'_>)->Vec<Vec2> {
     let starts=endpoints(g,origin,step,from,q);let ends=endpoints(g,origin,step,goal,q);
     let world=|c:Cell|origin+Vec2::new(c.x as f32,c.y as f32)*step;
-    for start in starts {for &end in &ends {
+    let (Some(&first),Some(&last))=(starts.first(),ends.first())else{return Vec::new();};
+    let path=nav::find_path_filtered(g,first,last,&|_,_|false,-1,&mut |a,b|q.clear(world(a),world(b),true));
+    if path.found {let mut result:Vec<_>=path.cells.into_iter().map(world).collect();result.push(goal);return result;}
+    // A sealed parking pocket used to repeat a full failed A* for every pair of
+    // fractional endpoints. Label reachability once, using exactly the same
+    // navigation edges and physical predicate. Preserve first-successful-pair order.
+    let id=|c:Cell|(c.y*g.w+c.x) as usize;
+    let mut labels=vec![usize::MAX;g.cost.len()];let mut queue=VecDeque::new();let mut component=0;
+    for start in starts {
+        if labels[id(start)]==usize::MAX {
+            labels[id(start)]=component;queue.push_back(start);
+            while let Some(a)=queue.pop_front() {for k in 0..8 {
+                let b=Cell::new(a.x+nav::K_DIR_X[k],a.y+nav::K_DIR_Y[k]);
+                if nav::step_cost(g,a,b).is_none()||labels[id(b)]!=usize::MAX||!q.clear(world(a),world(b),true) {continue;}
+                labels[id(b)]=component;queue.push_back(b);
+            }}component+=1;
+        }
+        for &end in &ends {if labels[id(end)]!=labels[id(start)] {continue;}
         let path=nav::find_path_filtered(g,start,end,&|_,_|false,-1,&mut |a,b|q.clear(world(a),world(b),true));
         if path.found {let mut result:Vec<_>=path.cells.into_iter().map(world).collect();result.push(goal);return result;}
     }}Vec::new()
@@ -122,5 +139,15 @@ mod tests {
         let mut q=Query{grid:&g,bodies:&[],index:&mut index,neighbors:&mut neighbors,owner:0,radius:0.45,max_radius:0.45};
         let path=Routes::default().path(&t,from,goal,1,0,&mut q);assert!(!path.is_empty());assert!(path.contains(&Vec2::new(20.0,12.0)));
         let mut previous=from;for p in path {assert!(q.clear(previous,p,true));previous=p;}assert_eq!(previous,goal);
+    }
+    #[test]
+    fn disconnected_fractional_endpoint_sets_do_not_repeat_exhaustive_searches() {
+        let mut g=CostGrid{w:24,h:18,cost:vec![1;24*18],..Default::default()};
+        for y in 0..18 {g.cost[y*24+12]=0;g.cost[y*24+13]=0;}
+        let mut index=Index::default();index.rebuild(&[]);let mut neighbors=Vec::new();
+        let mut q=Query{grid:&g,bodies:&[],index:&mut index,neighbors:&mut neighbors,owner:0,radius:0.45,max_radius:0.45};
+        let path=search(&g,Vec2::ZERO,1.0,Vec2::new(8.1,8.1),Vec2::new(17.1,8.1),&mut q);
+        assert!(path.is_empty());
+        assert!(index.stats.queries<64*g.cost.len(),"queries={}",index.stats.queries);
     }
 }

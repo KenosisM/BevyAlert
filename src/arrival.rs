@@ -176,6 +176,11 @@ mod tests {
                 if w.query::<&Unit>().iter(&w).all(|u|u.arrival.settled()) {break;}
             }
             let mut units:Vec<_>=w.query::<(Entity,&Unit)>().iter(&w).map(|(e,u)|(e,u.idx,formation::position(u))).collect();units.sort_by_key(|u|u.1);
+            if !w.query::<&Unit>().iter(&w).all(|u|u.arrival.settled()) {
+                for u in w.query::<&Unit>().iter(&w).filter(|u|!u.arrival.settled()).take(12) {
+                    println!("incomplete id={} position=({},{}) velocity=({},{}) preferred={:?} target={:?}",u.idx,u.cell_x,u.cell_y,u.vx,u.vy,u.preferred_velocity,u.parking);
+                }
+            }
             assert!(w.query::<&Unit>().iter(&w).all(|u|u.arrival.settled()),"count={count} did not finish by tick {tick}");
             assert_eq!(w.resource::<SimEnv>().reservations.claims.len(),count);
             let mut max_drift=0.0f32;

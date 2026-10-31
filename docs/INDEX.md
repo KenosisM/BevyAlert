@@ -52,7 +52,7 @@
 | `spatial.rs` | 稳定邻居、动态接触对、缓冲复用与密度诊断；见 [空间查询](SPATIAL.md) |
 | `formation.rs` / `local_nav.rs` | 跨集群独占停靠预约、入口配对与带半径近端路径；见 [目标区预约](FORMATIONS.md) |
 | `arrival.rs` | 按剩余路径制动、安静时间、命令完成与显式唤醒；见 [到达控制](ARRIVAL.md) |
-| `orca.rs` / `orca_tests.rs` | f64单位半平面、速度圆盘、可行性与原版参考对照；见 [ORCA数值核心](ORCA.md) |
+| `orca.rs` / `orca_obstacles.rs` | f64速度圆盘、单位/静态边界约束与正式模拟接入；原版参考及运行回归见 [ORCA](ORCA.md) |
 | `nav_properties.rs` | 共享有向边、独立最短路基准及真实移动回归；见 [导航规则](NAVIGATION.md) |
 | `simulation.rs` / `nav_headless.rs` | 窗口与无头共用的固定步长核心、采样事件和可复现输入；见 [模拟入口](SIMULATION.md) |
 | `nav_scenario.rs` / `nav_demo.rs` | 四色四群同步演示、场景配置与机器可读基线；见 [四群演示](NAV_DEMO.md) |
