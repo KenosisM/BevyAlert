@@ -22,8 +22,7 @@ pub struct Buffers {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandId(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandStatus { Idle, Active }
+pub use crate::arrival::CommandStatus;
 
 #[derive(Clone, Debug)]
 pub struct UnitSample {
@@ -32,6 +31,8 @@ pub struct UnitSample {
     pub status: CommandStatus,
     pub position: (f32, f32),
     pub velocity: (f32, f32),
+    pub motion:crate::arrival::Motion,
+    pub quiet_seconds:f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -57,7 +58,7 @@ pub struct TickSample {
     /// Old proximity heuristic, never a completed-command count.
     pub near_goal: usize,
     pub max_displacement: f32,
-    /// None until the arrival state machine is available.
+    /// None for legacy motion without exclusive parking targets.
     pub arrived: Option<usize>,
     pub times: PhaseTimes,
 }
@@ -104,6 +105,9 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     units.sort_by_key(|u| u.idx);
     assert!(units.windows(2).all(|p| p[0].idx != p[1].idx), "duplicate simulation unit ID");
     crate::formation::maintain(env,units);
+    for u in units.iter_mut() {if let Some(t)=&u.parking {
+        u.arrival.before(t,bevy::math::Vec2::new(u.cell_x,u.cell_y));
+    }}
     let formation_time=total.elapsed();
     let dt = env.runtime.dt();
     let phase = Instant::now();
@@ -126,7 +130,8 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             _ => 0.0,
         };
         let settled = if let Some(t)=&u.parking {
-            t.valid&&t.blocked.is_none()&&crate::formation::position(u).distance(t.position)<crate::formation::POINT_REACH_RADIUS
+            u.arrival.held()||(t.valid&&t.blocked.is_none()&&u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED
+                &&crate::formation::position(u).distance(t.position)<=crate::formation::POINT_REACH_RADIUS)
         }else {u.goal.x < 0
             || (u.goal.x >= 0
                 && (u.cell_x - u.goal.x as f32).abs() < env.crowd_params.arrive_radius
@@ -183,6 +188,10 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             dt,env.crowd_params.neighbor_radius.max(1.2));
         buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
         let goal=crate::formation::motion_goal(u);let goal=(goal.x,goal.y);
+        let preferred=if let Some(t)=&u.parking {
+            let remaining=t.remaining_distance(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),bevy::math::Vec2::new(goal.0,goal.1));
+            Some(u.arrival.preferred_speed(t,remaining,u.speed,agents[i].max_accel,dt))
+        }else{None};
         let mut steering_params=env.crowd_params;
         if u.parking.is_some() {
             steering_params.arrive_radius=crate::formation::POINT_REACH_RADIUS;
@@ -191,7 +200,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             // separation, encounter steering and continuous contact guards remain.
             steering_params.press_weight=0.0;
         }
-        let (vx, vy) = crowd::step_agent(
+        let (mut vx, mut vy) = crowd::step_agent_preferred(
             i,
             snapshot,
             &buffers.neighbors,
@@ -200,7 +209,9 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             &env.pressure,
             &steering_params,
             dt,
+            preferred,
         );
+        if let Some(cap)=preferred {let length=vx.hypot(vy);if length>cap&&length>0.0 {vx*=cap/length;vy*=cap/length;}}
         let from = (agents[i].x, agents[i].y);
         agents[i].x = from.0+vx*dt;
         agents[i].y = from.1+vy*dt;
@@ -244,6 +255,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         u.vx = dx / dt_safe;
         u.vy = dy / dt_safe;
         u.contact_hold=env.runtime.contacts.reasons[i]==crate::collision::Blocked::SafetyStop;
+        if let Some(t)=&u.parking {u.arrival.observe(t,bevy::math::Vec2::new(u.cell_x,u.cell_y),u.vx.hypot(u.vy),env.runtime.fixed_step().as_secs_f64());}
         u.path.clear();
         u.leg_t = 0.0;
 
@@ -309,11 +321,13 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             tick: env.tick, seed: env.runtime.seed,
             units: units.iter().map(|u| UnitSample {
                 id: u.idx, command: u.command_id,
-                status: if u.goal.x < 0 { CommandStatus::Idle } else { CommandStatus::Active },
+                status: crate::arrival::status(u),
                 position: (u.cell_x, u.cell_y), velocity: (u.vx, u.vy),
+                motion:u.arrival.motion,quiet_seconds:u.arrival.quiet_seconds,
             }).collect(),
             moved: dbg_moved, with_guide: dbg_guide, near_goal,
-            max_displacement: dbg_max_disp, arrived: None, times,
+            max_displacement: dbg_max_disp,
+            arrived:units.iter().all(|u|u.parking.is_some()||u.goal.x<0).then(||units.iter().filter(|u|u.arrival.settled()).count()),times,
         });
     }
     env.buffers=buffers;

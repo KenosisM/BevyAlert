@@ -372,6 +372,7 @@ pub struct Unit {
     pub command_id: Option<crate::simulation::CommandId>,
     pub parking: Option<crate::formation::Target>,
     pub contact_hold: bool,
+    pub arrival: crate::arrival::Arrival,
 
     pub on_ground: bool,
     /// 位置（格单位）。上游 onGround 实体用 (cellX,cellY)、非地面用 (x,y)；这里统一成格坐标。
@@ -435,6 +436,7 @@ impl Default for Unit {
             command_id: None,
             parking: None,
             contact_hold: false,
+            arrival: crate::arrival::Arrival::default(),
             on_ground: true,
             cell_x: 0.0,
             cell_y: 0.0,

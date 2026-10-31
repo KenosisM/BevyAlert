@@ -1680,6 +1680,12 @@ fn auto_order(world: &mut World) {
     if world.get_resource::<ButtonInput<KeyCode>>().is_some_and(|keys|keys.just_pressed(KeyCode::KeyX)) {
         let count=play::cancel_selected(world);println!("cancel -> {count} selected units");return;
     }
+    if world.get_resource::<ButtonInput<KeyCode>>().is_some_and(|keys|keys.just_pressed(KeyCode::KeyH)) {
+        let count=play::stop_selected(world);println!("stop -> {count} selected units");return;
+    }
+    if world.get_resource::<ButtonInput<KeyCode>>().is_some_and(|keys|keys.just_pressed(KeyCode::KeyU)) {
+        let count=play::wake_selected(world,crate::arrival::WakeReason::Resume);println!("resume -> {count} selected units");return;
+    }
     if let Some(d) = dest {
         let report = play::issue_order(world, d);
         println!("order -> ({},{}) : {report:?}", d.x, d.y);

@@ -95,6 +95,7 @@ fn issue_orders_inner(world:&mut World,requests:&[(Vec<Entity>,Cell)])->Vec<Orde
             u.goal=Cell::new(target.position.x.round() as i32,target.position.y.round() as i32);
             u.parking=Some(target);u.command_id=Some(command);u.guide=Some(plan.guide.clone());
             u.contact_hold=false;
+            u.arrival.accept();
             u.start_delay=0.0;u.ap_budget=ap_budget;u.stall_ticks=0;u.still_ticks=0;u.escape_ticks=0;u.turret_idle=false;
             if u.path.len()!=2 {u.path.clear();u.leg_t=0.0;}
             staged.claims.get_mut(&id).unwrap().command=command.0;
@@ -113,8 +114,23 @@ pub fn cancel_selected(world:&mut World)->usize {
         if let Some(mut u)=world.get_mut::<Unit>(e) {
             ids.insert(u.idx);u.goal=Cell::new(-1,-1);u.command_id=None;u.parking=None;u.guide=None;
             u.contact_hold=false;
+            u.arrival.cancel();
             u.path.clear();u.leg_t=0.0;u.vx=0.0;u.vy=0.0;u.stall_ticks=0;u.escape_ticks=0;
         }
     }
     let mut env=world.resource_mut::<SimEnv>();for id in &ids {env.reservations.release(*id);}ids.len()
+}
+
+/// Explicit stop retains the command and reservation; resume does not reallocate a slot.
+pub fn stop_selected(world:&mut World)->usize {
+    let selected=world.resource::<Selection>().0.clone();let mut ids=BTreeSet::new();
+    for e in selected {if let Some(mut u)=world.get_mut::<Unit>(e) {if u.command_id.is_some()&&u.parking.is_some()&&ids.insert(u.idx) {
+        u.arrival.stop();u.vx=0.0;u.vy=0.0;
+    }}}ids.len()
+}
+pub fn wake_selected(world:&mut World,reason:crate::arrival::WakeReason)->usize {
+    let selected=world.resource::<Selection>().0.clone();let mut ids=BTreeSet::new();
+    for e in selected {if let Some(mut u)=world.get_mut::<Unit>(e) {if u.command_id.is_some()&&u.parking.is_some()&&ids.insert(u.idx) {
+        u.arrival.wake(reason);
+    }}}ids.len()
 }

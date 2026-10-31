@@ -209,6 +209,12 @@ pub fn step_agent(
     params: &Params,
     _dt: f32,
 ) -> (f32, f32) {
+    step_agent_preferred(i,agents,neighbors,desired_dir,goal,pressure,params,_dt,None)
+}
+
+/// Exclusive parking supplies path-based braking; legacy callers retain their old curve.
+pub fn step_agent_preferred(i:usize,agents:&[Agent],neighbors:&[usize],desired_dir:(f32,f32),goal:(f32,f32),
+    pressure:&Pressure,params:&Params,_dt:f32,preferred_speed:Option<f32>)->(f32,f32) {
     let me = agents[i];
 
     let to_goal = (goal.0 - me.x, goal.1 - me.y);
@@ -218,10 +224,11 @@ pub fn step_agent(
     }
 
     // ---- 长程期望速度 --------------------------------------------------------
-    let mut vx = desired_dir.0 * me.speed;
-    let mut vy = desired_dir.1 * me.speed;
+    let preferred=preferred_speed.unwrap_or(me.speed).max(0.0);
+    let mut vx = desired_dir.0 * preferred;
+    let mut vy = desired_dir.1 * preferred;
     // 快到了就减速，避免冲过终点再掉头（这是「抽搐」的常见来源之一）
-    let brake = (goal_dist / 1.5).clamp(0.25, 1.0);
+    let brake = if preferred_speed.is_some(){1.0}else{(goal_dist / 1.5).clamp(0.25, 1.0)};
     vx *= brake;
     vy *= brake;
 

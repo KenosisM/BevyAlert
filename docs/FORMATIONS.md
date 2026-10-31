@@ -36,4 +36,4 @@
 `blocked_near_path`、`command_plan_us`、`formation_us` 和 `entry_refinements`；单位
 末态包含实际停靠点和有效/冻结/阻挡状态。维护耗时包含在模拟总耗时内。
 0.05格是近端点导航的停止容差，不是单位物理半径，也不是命令完成定义。
-停车状态机和稳定性尚未接入，到达指标继续使用 `not-ready`。
+命令完成、保持时间、稳定停车及显式停止/唤醒见 [到达控制](ARRIVAL.md)。

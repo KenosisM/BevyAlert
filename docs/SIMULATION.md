@@ -30,10 +30,13 @@ and timings for snapshot, pressure, velocity, contact, and writeback. Sampling
 does not open files or read environment switches per tick. Callers decide how to
 present or persist observations.
 
-Arrival is **not ready**: `TickSample::arrived` is `None`. The existing proximity
-heuristic, inactivity and turret idling do not mean that a command completed.
-The existing steering, pressure rebuild cadence, stall escape and overlap
-projection are retained, including their known collision and parking limitations.
+Exclusive parking commands use [arrival control](ARRIVAL.md): completion observes
+committed position and velocity for a continuous quiet interval, keeps the parking
+reservation, and emits `Completed`. Samples include motion state and quiet seconds.
+Legacy inputs without exclusive targets, including the small `nav-headless`
+refactor fixture, retain `TickSample::arrived = None`. Proximity, inactivity and
+turret idling remain separate observations. The full scenario entry is
+`nav-demo --headless`; its arrival counts are ready in continuous mode.
 
 Tests compare the ECS adapter and direct core on every tick at 30, 60 and 120 Hz,
 check seed reproducibility and observational sampling, and prevent simultaneous

@@ -55,7 +55,8 @@ impl Target {
     pub fn local_direction(&mut self,from:Vec2,goal:Vec2,command:u64,tick:u64,
         q:&mut crate::local_nav::Query<'_>,routes:&mut crate::local_nav::Routes)->Vec2 {
         if q.clear(from,goal,true) {
-            self.blocked=None;return (goal-from).normalize_or_zero();
+            self.blocked=None;self.route.clear();self.cursor=0;self.route_goal=None;
+            return (goal-from).normalize_or_zero();
         }
         let broken=self.route.get(self.cursor..).is_some_and(|p|p.windows(2).any(|e|!q.clear(e[0],e[1],true)));
         if self.route_goal!=Some(goal)||self.cursor>=self.route.len()||broken {
@@ -74,6 +75,12 @@ impl Target {
             self.route_goal=None;self.blocked=Some(TargetBlock::NoLocalPath);return Vec2::ZERO;
         }
         self.blocked=None;(waypoint-from).normalize_or_zero()
+    }
+    pub fn remaining_distance(&self,here:Vec2,goal:Vec2)->f32 {
+        if self.blocked==Some(TargetBlock::NoLocalPath)||!self.valid {return f32::INFINITY;}
+        if self.route_goal==Some(goal)&&self.cursor<self.route.len() {
+            here.distance(self.route[self.cursor])+self.route[self.cursor..].windows(2).map(|p|p[0].distance(p[1])).sum::<f32>()
+        }else{here.distance(goal)}
     }
 }
 
@@ -199,7 +206,7 @@ pub fn parking_position(u:&crate::world::Unit)->Vec2 {
 pub fn body(u:&crate::world::Unit,radius:f32)->Body {
     Body{id:u.idx,position:position(u),radius:u.parking.as_ref().map_or(radius,|t|t.radius),
         idle:u.goal.x<0,
-        departing:u.goal.x>=0&&(position(u).distance(parking_position(u))>if u.parking.is_some(){POINT_REACH_RADIUS}else{0.45}
+        departing:u.goal.x>=0&&!u.arrival.held()&&(position(u).distance(parking_position(u))>if u.parking.is_some(){POINT_REACH_RADIUS}else{0.45}
             ||u.vx.hypot(u.vy)>0.05)}
 }
 
@@ -271,7 +278,7 @@ pub fn maintain(env:&mut crate::world::SimEnv,units:&mut [crate::world::Unit]) {
     let active:BTreeSet<_>=units.iter().filter_map(|u|u.command_id.map(|c|c.0)).collect();env.buffers.local_routes.prune(&active);
     env.buffers.idle_index.begin_tick();env.buffers.idle_bodies.clear();
     env.buffers.idle_bodies.extend(units.iter().filter(|u|u.on_ground&&(u.goal.x<0||u.parking.as_ref().is_some_and(|t|
-        u.vx.hypot(u.vy)<=0.05&&(position(u).distance(t.position)<=POINT_REACH_RADIUS||t.blocked==Some(TargetBlock::Entrance)||u.contact_hold))))
+        u.vx.hypot(u.vy)<=0.05&&(position(u).distance(t.position)<=POINT_REACH_RADIUS||u.arrival.held()||t.blocked==Some(TargetBlock::Entrance)||u.contact_hold))))
         .map(|u|body(u,env.crowd_params.radius_default())));
     let idle_radius=env.buffers.idle_bodies.iter().map(|b|b.radius).fold(0.0f32,f32::max);
     env.buffers.idle_bounds.clear();env.buffers.idle_bounds.extend(env.buffers.idle_bodies.iter().map(|b|Aabb::point(b.position)));
@@ -493,6 +500,7 @@ mod tests {
     fn single_groups_64_and_256_keep_frozen_targets_and_reach_their_near_region() {
         for (n,jitter) in [(64,0.0f32),(256,0.0),(64,0.02),(256,0.02)] {
             let mut w=world(64,56);let a=group(&mut w,0,n,Vec2::new(18.0,28.0));w.resource_mut::<Selection>().0=a.clone();
+            w.resource_mut::<SimEnv>().runtime.sample_every=1;
             let mut seed=42u64;
             for e in &a {
                 let mut u=w.get_mut::<Unit>(*e).unwrap();
@@ -533,8 +541,8 @@ mod tests {
                 contact.reasons.iter().filter(|r|**r==crate::collision::Blocked::SafetyStop).count(),contact.max_penetration,contact.initial_overlaps);
             assert_eq!(frozen_count,n);
             assert!(max_remaining<0.15,"count={n} remaining={max_remaining}");
-            // This verifies near navigation; strict Settled and drift checks belong to the arrival state machine.
-            assert_eq!(w.resource::<SimEnv>().runtime.last_sample.as_ref().and_then(|s|s.arrived),None);
+            assert!(a.iter().all(|e|w.get::<Unit>(*e).unwrap().arrival.settled()));
+            assert_eq!(w.resource::<SimEnv>().runtime.last_sample.as_ref().and_then(|s|s.arrived),Some(n));
         }
     }
 }
