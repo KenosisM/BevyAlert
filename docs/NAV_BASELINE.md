@@ -1,6 +1,8 @@
 # 初始群体行为基线
 
 这些数据保留初始移动系统的缺陷，作为导航、接触和停车改造的对照。
+对应实现见 [初始演示 PR](https://github.com/KenosisM/BevyAlert/pull/3)，
+它们是历史数据，后续导航修正会改变轨迹。
 构建为 Windows x64、Rust 1.97.1、Dev（本包 opt-level=1），固定 60 Hz。
 每例运行 3600 tick，即 60 秒模拟时间；完全对称，Seed=0、Jitter=0。
 

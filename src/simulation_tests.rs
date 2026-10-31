@@ -1,6 +1,5 @@
 use bevy::prelude::*;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::nav::{self, Cell, CostGrid, FlowField};
 use crate::world::{self, SimEnv, Unit};
@@ -45,26 +44,6 @@ fn fingerprint_state(env: &SimEnv, units: &[&Unit]) -> u64 {
     feed(env.since_pressure);
     for p in &env.pressure.field { feed(p.to_bits()); }
     hash
-}
-
-#[test]
-fn continuous_refactor_preserves_recorded_baseline() {
-    let (env, units) = fixture();
-    let mut world = World::new();
-    world.insert_resource(env);
-    let mut time = Time::<Fixed>::from_hz(60.0);
-    time.advance_by(Duration::from_secs_f64(1.0 / 60.0));
-    world.insert_resource(time);
-    for u in units.into_iter().rev() { world.spawn(u); }
-    let mut schedule = Schedule::default();
-    schedule.add_systems(world::update_sim_crowd);
-    const EXPECTED: [(u64, u64); 5] = [(1, 0x6ed72c8db04e1557), (4, 0x4163f401b6614c01), (31, 0x6ee369b78fccbd06), (120, 0x28632edbb38e9cc2), (240, 0x290d1f8f2fb3bb53)];
-    for tick in 1..=240 {
-        schedule.run(&mut world);
-        if let Some(&(_, expected)) = EXPECTED.iter().find(|&&(t, _)| t == tick) {
-            assert_eq!(fingerprint(&mut world), expected, "baseline tick={tick}");
-        }
-    }
 }
 
 #[test]

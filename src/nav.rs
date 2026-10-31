@@ -1,13 +1,10 @@
-//! 格网寻路 —— 对等移植。
+//! 格网寻路与共享有向通行规则。
 //!
 //! 来源：`I:\bevy\RA2REASM\src\engine\nav.cpp` / `nav.h`。
 //!
-//! 网格 = 玩法格（rx, ry）；一条路径就是一串格，所以单位始终对齐到格 —— 引擎的地面场正是
-//! 按这个假设写的。这里的 CPU 实现是**正确性基准**。
-//!
-//! 🔴 本文件是**逐行对等搬运**：分支、常数、边界判断、tie-break 顺序一项不少。
-//! 唯一无法对等的地方已在注释里标明（C++ `std::priority_queue` 在 f 相等时的弹出顺序本身
-//! 就是未定义的，见 `Node::cmp`）。
+//! 算法返回相邻格路径；连续运动在同一锚点网格上积分浮点位置。
+//! A*、流场反向传播、方向提取与实际迈步共用 step_cost 的通行和代价定义。
+//! 上述来源保留初始移植背景；当前导航包含明确的正确性修正。
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
@@ -41,13 +38,16 @@ pub struct CostGrid {
 }
 
 impl CostGrid {
+    pub fn valid(&self) -> bool {
+        self.w > 0 && self.h > 0 && (self.w as usize).checked_mul(self.h as usize) == Some(self.cost.len())
+    }
     /// 上游 `CostGrid::in`。`in` 是 Rust 关键字，这里叫 `in_`。
     pub fn in_(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && x < self.w && y < self.h
     }
     pub fn at(&self, x: i32, y: i32) -> i32 {
         if self.in_(x, y) {
-            self.cost[(y as usize) * (self.w as usize) + (x as usize)] as i32
+            self.cost.get((y as usize) * (self.w as usize) + (x as usize)).copied().unwrap_or(0) as i32
         } else {
             0
         }
@@ -69,11 +69,61 @@ pub fn diagonal_allowed(g: &CostGrid, cx: i32, cy: i32, nx: i32, ny: i32) -> boo
     }
     let side_a = g.walkable(nx, cy);
     let side_b = g.walkable(cx, ny);
-    if g.cut_corners {
-        side_a || side_b
-    } else {
-        side_a && side_b
+    corner_allowed(g.cut_corners,side_a,side_b)
+}
+
+fn corner_allowed(cut:bool,a:bool,b:bool)->bool {if cut {a||b} else {a&&b}}
+
+/// Directed adjacent edge: destination terrain cost times geometric step length.
+/// Grids supplied here already contain footprint erosion; cut_corners belongs to that grid.
+pub fn step_cost(g: &CostGrid, from: Cell, to: Cell) -> Option<f32> {
+    step_cost_extra(g, from, to, &|_, _| false)
+}
+
+pub fn step_cost_extra(g: &CostGrid, from: Cell, to: Cell, blocked: &dyn Fn(i32,i32)->bool) -> Option<f32> {
+    if !g.valid() || !g.walkable(from.x,from.y) || !g.walkable(to.x,to.y)
+        || blocked(from.x,from.y) || blocked(to.x,to.y) {return None;}
+    let dx=to.x-from.x; let dy=to.y-from.y;
+    if dx.abs()>1 || dy.abs()>1 || (dx==0 && dy==0) { return None; }
+    let diagonal=dx!=0 && dy!=0;
+    if diagonal {
+        let a=g.walkable(to.x,from.y)&&!blocked(to.x,from.y);
+        let b=g.walkable(from.x,to.y)&&!blocked(from.x,to.y);
+        if !corner_allowed(g.cut_corners,a,b) {return None;}
     }
+    Some(g.at(to.x,to.y) as f32 * if diagonal { K_DIAG } else {1.0})
+}
+
+/// Point-centre traversal through every crossed grid edge. Disc clearance is separate.
+pub fn segment_allowed(g: &CostGrid, from:(f32,f32), to:(f32,f32)) -> bool {
+    if !g.valid() || ![from.0,from.1,to.0,to.1].iter().all(|v|v.is_finite()) { return false; }
+    let mut cell=Cell::new(from.0.round() as i32,from.1.round() as i32);
+    let end=Cell::new(to.0.round() as i32,to.1.round() as i32);
+    if !g.walkable(cell.x,cell.y)||!g.walkable(end.x,end.y) {return false;}
+    let dx=to.0-from.0;let dy=to.1-from.1;
+    let sx=if dx>0.0 {1} else if dx<0.0 {-1} else {0};
+    let sy=if dy>0.0 {1} else if dy<0.0 {-1} else {0};
+    let delta_x=if sx==0 {f32::INFINITY} else {1.0/dx.abs()};
+    let delta_y=if sy==0 {f32::INFINITY} else {1.0/dy.abs()};
+    let mut tx=if sx==0 {f32::INFINITY} else {(cell.x as f32+0.5*sx as f32-from.0)/dx};
+    let mut ty=if sy==0 {f32::INFINITY} else {(cell.y as f32+0.5*sy as f32-from.1)/dy};
+    for _ in 0..(g.w as usize+g.h as usize+4) {
+        if cell==end {return true;}
+        let mut next=cell;
+        if (tx-ty).abs()<=1e-6 {next.x+=sx;next.y+=sy;tx+=delta_x;ty+=delta_y;}
+        else if tx<ty {next.x+=sx;tx+=delta_x;} else {next.y+=sy;ty+=delta_y;}
+        if step_cost(g,cell,next).is_none() {return false;}
+        cell=next;
+    }
+    false
+}
+
+/// Read a legal descending edge from a field built on the same grid dimensions.
+pub fn flow_step(g:&CostGrid, ff:&FlowField, from:Cell) -> Option<Cell> {
+    if !ff.valid_for(g) || !g.walkable(from.x,from.y) || ff.dist_at(from.x,from.y)>=1e29 {return None;}
+    let (dx,dy)=ff.dir_at(from.x,from.y);let to=Cell::new(from.x+dx,from.y+dy);
+    step_cost(g,from,to)?;
+    (ff.dist_at(to.x,to.y)<ff.dist_at(from.x,from.y)).then_some(to)
 }
 
 /// 一个单位要占多大。玩法是格制的，所以再小的单位也要一格；车辆默认 1x1。
@@ -126,12 +176,16 @@ pub struct FlowField {
 }
 
 impl FlowField {
+    pub fn valid_for(&self,g:&CostGrid)->bool {
+        let n=g.cost.len(); g.valid() && self.w==g.w && self.h==g.h && self.dist.len()==n
+            && self.dir_x.len()==n && self.dir_y.len()==n && self.is_source.len()==n
+    }
     pub fn in_(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && x < self.w && y < self.h
     }
     pub fn dist_at(&self, x: i32, y: i32) -> f32 {
         if self.in_(x, y) {
-            self.dist[(y as usize) * (self.w as usize) + (x as usize)]
+            self.dist.get((y as usize) * (self.w as usize) + (x as usize)).copied().unwrap_or(1e30)
         } else {
             1e30f32
         }
@@ -142,14 +196,14 @@ impl FlowField {
             return (0, 0);
         }
         let i = (y as usize) * (self.w as usize) + (x as usize);
-        (self.dir_x[i] as i32, self.dir_y[i] as i32)
+        (self.dir_x.get(i).copied().unwrap_or(0) as i32, self.dir_y.get(i).copied().unwrap_or(0) as i32)
     }
 }
 
 // ============================================================================ 内部工具
 
-const K_DIR_X: [i32; 8] = [1, -1, 0, 0, 1, 1, -1, -1];
-const K_DIR_Y: [i32; 8] = [0, 0, 1, -1, 1, -1, 1, -1];
+pub(crate) const K_DIR_X: [i32; 8] = [1, -1, 0, 0, 1, 1, -1, -1];
+pub(crate) const K_DIR_Y: [i32; 8] = [0, 0, 1, -1, 1, -1, 1, -1];
 const K_DIAG: f32 = 1.41421356;
 
 /// Octile 距离：对 8 向、最小代价为 1 的移动是可采纳的启发。
@@ -161,38 +215,8 @@ fn octile(dx: i32, dy: i32) -> f32 {
 }
 
 /// Bresenham supercover：直线只穿过可通行的格，也绝不从被挡的对角缝里溜过去。
-fn line_clear(g: &CostGrid, a: Cell, b: Cell) -> bool {
-    let mut x = a.x;
-    let mut y = a.y;
-    let dx = (b.x - x).abs();
-    let dy = (b.y - y).abs();
-    let sx = if x < b.x { 1 } else { -1 };
-    let sy = if y < b.y { 1 } else { -1 };
-    let mut err = dx - dy;
-    loop {
-        if !g.walkable(x, y) {
-            return false;
-        }
-        if x == b.x && y == b.y {
-            return true;
-        }
-        let e2 = 2 * err;
-        let mut nx = x;
-        let mut ny = y;
-        if e2 > -dy {
-            err -= dy;
-            nx += sx;
-        }
-        if e2 < dx {
-            err += dx;
-            ny += sy;
-        }
-        if !diagonal_allowed(g, x, y, nx, ny) {
-            return false;
-        }
-        x = nx;
-        y = ny;
-    }
+fn line_clear(g: &CostGrid,a:Cell,b:Cell)->bool {
+    segment_allowed(g,(a.x as f32,a.y as f32),(b.x as f32,b.y as f32))
 }
 
 /// 小顶堆节点（按 f / d 排）。
@@ -245,7 +269,7 @@ pub fn find_path_extra(
         expanded: 0,
         found: false,
     };
-    if !g.in_(from.x, from.y) || !g.in_(to.x, to.y) {
+    if !g.valid() || !g.in_(from.x, from.y) || !g.in_(to.x, to.y) {
         return out;
     }
     if !g.walkable(from.x, from.y) || !g.walkable(to.x, to.y) {
@@ -300,25 +324,11 @@ pub fn find_path_extra(
         for d in 0..8 {
             let nx = cx + K_DIR_X[d];
             let ny = cy + K_DIR_Y[d];
-            if !g.in_(nx, ny) || !g.walkable(nx, ny) {
-                continue;
-            }
-            if extra_blocked(nx, ny) {
-                continue;
-            }
-            let diag = K_DIR_X[d] != 0 && K_DIR_Y[d] != 0;
-            if !diagonal_allowed(g, cx, cy, nx, ny) {
-                continue;
-            }
-            // 对角会蹭到的那个角上若有动态障碍，也算被占 —— 单位贴着队友过去时不能蹭穿它的侧翼。
-            if diag && (extra_blocked(nx, cy) || extra_blocked(cx, ny)) {
-                continue;
-            }
+            let Some(step)=step_cost_extra(g,Cell::new(cx,cy),Cell::new(nx,ny),extra_blocked) else {continue;};
             let ni = idx(nx, ny) as i32;
             if closed[ni as usize] != 0 {
                 continue;
             }
-            let step = (g.at(nx, ny) as f32) * if diag { K_DIAG } else { 1.0 };
             let tentative = g_score[cur.i as usize] + step;
             if tentative < g_score[ni as usize] {
                 g_score[ni as usize] = tentative;
@@ -335,67 +345,17 @@ pub fn find_path_extra(
 
 // ============================================================================ 流场求解
 
-/// 单目标 Dijkstra（8 向、不许切角），再从目标向外写方向场。
-pub fn compute_flow_field_cpu(g: &CostGrid, goal: Cell, out: &mut FlowField) -> bool {
-    out.w = g.w;
-    out.h = g.h;
-    let n = (g.w as usize) * (g.h as usize);
-    out.dist = vec![1e30f32; n];
-    out.dir_x = vec![0i8; n];
-    out.dir_y = vec![0i8; n];
-    if !g.walkable(goal.x, goal.y) {
-        return false;
-    }
-
-    let idx = |x: i32, y: i32| (y as usize) * (g.w as usize) + (x as usize);
-
-    let mut pq: BinaryHeap<Node> = BinaryHeap::new();
-    let mut done = vec![0u8; n];
-    let gi = idx(goal.x, goal.y) as i32;
-    out.dist[gi as usize] = 0.0;
-    // 单源场就是多源场的单种子特例，所以它带同一张 source 图：读场的人能用同一套判断
-    // 「我站在目的地上」。留空正是当年把到达判定悄悄关掉的原因。
-    out.is_source = vec![0u8; n];
-    out.sources.clear();
-    out.is_source[gi as usize] = 1;
-    out.sources.push(goal);
-    pq.push(Node { f: 0.0, i: gi });
-
-    while let Some(c) = pq.pop() {
-        if done[c.i as usize] != 0 {
-            continue;
-        }
-        done[c.i as usize] = 1;
-        let cx = c.i % g.w;
-        let cy = c.i / g.w;
-        for d in 0..8 {
-            let nx = cx + K_DIR_X[d];
-            let ny = cy + K_DIR_Y[d];
-            if !g.in_(nx, ny) || !g.walkable(nx, ny) {
-                continue;
-            }
-            let diag = K_DIR_X[d] != 0 && K_DIR_Y[d] != 0;
-            if !diagonal_allowed(g, cx, cy, nx, ny) {
-                continue;
-            }
-            let step = (g.at(nx, ny) as f32) * if diag { K_DIAG } else { 1.0 };
-            let nd = c.f + step;
-            let ni = idx(nx, ny);
-            if nd < out.dist[ni] {
-                out.dist[ni] = nd;
-                pq.push(Node { f: nd, i: ni as i32 });
-            }
-        }
-    }
-
-    write_directions(g, out);
-    true
+/// 单目标是多源求解的特例，共用同一有向边代价和网格切角规则。
+pub fn compute_flow_field_cpu(g:&CostGrid,goal:Cell,out:&mut FlowField)->bool {
+    compute_flow_field_cpu_multi(g,&[goal],out)
 }
 
 /// 多源版：队列一开始就放入**所有**种子（距离 0）。云从一个整体向外扩，于是每格的距离是
 /// 它到**最近**种子的距离、方向也指向那个种子。共享这一张场，正是让一个编队的路线不互相
 /// 交叉的原因：两个邻居读同一份箭头，于是跑成平行线，而不是各自解一条恰好撞上的私路。
 pub fn compute_flow_field_cpu_multi(g: &CostGrid, sources: &[Cell], out: &mut FlowField) -> bool {
+    *out=FlowField::default();
+    if !g.valid() {return false;}
     out.w = g.w;
     out.h = g.h;
     let n = (g.w as usize) * (g.h as usize);
@@ -438,14 +398,8 @@ pub fn compute_flow_field_cpu_multi(g: &CostGrid, sources: &[Cell], out: &mut Fl
         for d in 0..8 {
             let nx = cx + K_DIR_X[d];
             let ny = cy + K_DIR_Y[d];
-            if !g.in_(nx, ny) || !g.walkable(nx, ny) {
-                continue;
-            }
-            let diag = K_DIR_X[d] != 0 && K_DIR_Y[d] != 0;
-            if !diagonal_allowed(g, cx, cy, nx, ny) {
-                continue;
-            }
-            let step = (g.at(nx, ny) as f32) * if diag { K_DIAG } else { 1.0 };
+            // Reverse propagation uses the forward incoming edge nx,ny -> cx,cy.
+            let Some(step)=step_cost(g,Cell::new(nx,ny),Cell::new(cx,cy)) else {continue;};
             let nd = c.f + step;
             let ni = idx(nx, ny);
             if nd < out.dist[ni] {
@@ -459,9 +413,7 @@ pub fn compute_flow_field_cpu_multi(g: &CostGrid, sources: &[Cell], out: &mut Fl
     true
 }
 
-/// 方向场：让每格指向「邻居距离 + 进入本格的代价」最小的那个邻居。
-/// 用本格自己的进入代价打分，且**允许相等** —— 前驱恰好打平，用严格 `<` 会让每个已收敛的格
-/// 都像局部极小。
+/// 方向场使用 Bellman 条件：本格到邻格的有向成本 + 邻格剩余成本。
 fn write_directions(g: &CostGrid, out: &mut FlowField) {
     let idx = |x: i32, y: i32| (y as usize) * (g.w as usize) + (x as usize);
     for y in 0..g.h {
@@ -473,21 +425,14 @@ fn write_directions(g: &CostGrid, out: &mut FlowField) {
             if out.dist[i] >= 1e29f32 {
                 continue;
             }
-            let c_self = g.at(x, y) as f32;
             let mut best = out.dist[i] + 1e-3;
             let mut bx = 0;
             let mut by = 0;
             for d in 0..8 {
                 let nx = x + K_DIR_X[d];
                 let ny = y + K_DIR_Y[d];
-                if !g.in_(nx, ny) || !g.walkable(nx, ny) {
-                    continue;
-                }
-                let diag = K_DIR_X[d] != 0 && K_DIR_Y[d] != 0;
-                if !diagonal_allowed(g, x, y, nx, ny) {
-                    continue;
-                }
-                let v = out.dist[idx(nx, ny)] + c_self * if diag { K_DIAG } else { 1.0 };
+                let Some(edge)=step_cost(g,Cell::new(x,y),Cell::new(nx,ny)) else {continue;};
+                let v=out.dist[idx(nx,ny)]+edge;
                 if v < best {
                     best = v;
                     bx = K_DIR_X[d];
@@ -510,10 +455,11 @@ pub fn path_to_nearest_source(
     out: &mut Vec<Cell>,
 ) -> bool {
     out.clear();
+    *reached=Cell::new(-1,-1);
     if !g.in_(from.x, from.y) || !g.walkable(from.x, from.y) {
         return false;
     }
-    if ff.w != g.w || ff.h != g.h {
+    if !ff.valid_for(g) {
         return false;
     }
     out.push(from);
@@ -525,18 +471,11 @@ pub fn path_to_nearest_source(
             *reached = cur;
             return true; // 命中种子格：单位到达目的地
         }
-        let (dx, dy) = ff.dir_at(cur.x, cur.y);
-        if dx == 0 && dy == 0 {
-            return false; // 这张场从这里到不了任何种子
-        }
-        let nx = cur.x + dx;
-        let ny = cur.y + dy;
-        if !g.in_(nx, ny) || !g.walkable(nx, ny) {
-            return false;
-        }
-        cur = Cell { x: nx, y: ny };
+        let Some(next)=flow_step(g,ff,cur) else {out.clear();return false;};
+        cur=next;
         out.push(cur);
     }
+    out.clear();
     false
 }
 
@@ -552,7 +491,7 @@ pub fn path_from_flow_field(
     if !g.walkable(from.x, from.y) || !g.walkable(goal.x, goal.y) {
         return false;
     }
-    if ff.w != g.w || ff.h != g.h {
+    if !ff.valid_for(g) {
         return false;
     }
     out.push(from);
@@ -561,19 +500,11 @@ pub fn path_from_flow_field(
     let mut step = 0usize;
     while cur.x != goal.x || cur.y != goal.y {
         if step > guard {
-            return false;
+            out.clear(); return false;
         }
         step += 1;
-        let (dx, dy) = ff.dir_at(cur.x, cur.y);
-        if dx == 0 && dy == 0 {
-            return false;
-        }
-        let nx = cur.x + dx;
-        let ny = cur.y + dy;
-        if !g.in_(nx, ny) || !g.walkable(nx, ny) {
-            return false;
-        }
-        cur = Cell { x: nx, y: ny };
+        let Some(next)=flow_step(g,ff,cur) else {out.clear();return false;};
+        cur=next;
         out.push(cur);
     }
     !out.is_empty()
@@ -632,6 +563,7 @@ pub fn facing_angle_of(dx: f32, dy: f32) -> f32 {
 
 /// 锚在 (x,y) 的单位是否整块都站在可走格上。
 pub fn fits(g: &CostGrid, f: &Footprint, x: i32, y: i32) -> bool {
+    if !g.valid() || f.w<=0 || f.h<=0 {return false;}
     for j in 0..f.h {
         for i in 0..f.w {
             if !g.walkable(x + i + f.ox, y + j + f.oy) {
@@ -650,8 +582,8 @@ pub fn erode_grid(g: &CostGrid, f: &Footprint) -> CostGrid {
     out.w = g.w;
     out.h = g.h;
     out.cut_corners = f.cut_corners; // 规则跟着单位解算用的那张网走
-    if g.w <= 0 || g.h <= 0 {
-        return out;
+    if !g.valid() || f.w<=0 || f.h<=0 {
+        return CostGrid::default();
     }
     out.cost = vec![0u8; (g.w as usize) * (g.h as usize)];
     for y in 0..g.h {
@@ -1418,7 +1350,7 @@ pub fn find_path_hierarchical(
     block_size: i32,
 ) -> bool {
     out.clear();
-    if !g.walkable(from.x, from.y) || !g.walkable(to.x, to.y) {
+    if !g.valid() || !g.walkable(from.x, from.y) || !g.walkable(to.x, to.y) {
         return false;
     }
     if from.x == to.x && from.y == to.y {

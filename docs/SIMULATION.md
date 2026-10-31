@@ -37,6 +37,13 @@ projection are retained, including their known collision and parking limitations
 
 Tests compare the ECS adapter and direct core on every tick at 30, 60 and 120 Hz,
 check seed reproducibility and observational sampling, and prevent simultaneous
-position writes by both modes. A five-checkpoint fingerprint was captured from
-the original continuous ECS implementation on a synthetic wall scenario before
-extraction, and is checked unchanged by the refactor.
+position writes by both modes. The initial extraction also matched five recorded
+trajectory checkpoints in [the original refactor](https://github.com/KenosisM/BevyAlert/pull/2):
+`6ed72c8db04e1557`, `4163f401b6614c01`, `6ee369b78fccbd06`,
+`28632edbb38e9cc2`, `290d1f8f2fb3bb53` at ticks 1, 4, 31, 120 and 240.
+
+These are historical fingerprints, not constraints on intentional navigation
+fixes. Current navigation correctness is checked against an independently
+constructed small-graph shortest-path reference and production movement tests;
+see [navigation rules](NAVIGATION.md). The ECS/core equivalence and sampling
+invariance checks continue to run on the current implementation.

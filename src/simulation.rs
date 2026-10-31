@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 use crate::crowd;
 use crate::nav;
-use crate::world::{SimEnv, Unit, K_NEIGH_X, K_NEIGH_Y, aim_turret, turn_toward};
+use crate::world::{SimEnv, Unit, aim_turret, turn_toward};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandId(pub u64);
@@ -142,7 +142,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             continue;
         }
         let goal = (u.goal.x as f32, u.goal.y as f32);
-        let mut dir = long_range_dir(u, &snapshot[i], goal);
+        let mut dir = long_range_dir(&env.nav, u, &snapshot[i], goal);
         // 保留原有切向逃逸，直到显式停滞恢复接管。
         if u.escape_ticks > 0 {
             dir = crowd::rotate90(dir, u.escape_side);
@@ -231,7 +231,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         // 闲置只影响炮塔显示；这里不宣称命令已到达或完成。
         u.turret_idle = u.still_ticks > 20;
 
-        aim_turret(u, dt);
+        aim_turret(u, &env.nav, dt);
 
         // 贴地
         if env.ground.valid() {
@@ -270,7 +270,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
 }
 
 /// 长程方向：场里 8 邻域的最省格；没有场就直指目标。
-fn long_range_dir(u: &Unit, me: &crowd::Agent, goal: (f32, f32)) -> (f32, f32) {
+fn long_range_dir(grid:&nav::CostGrid, u: &Unit, me: &crowd::Agent, goal: (f32, f32)) -> (f32, f32) {
     let fallback = {
         let dx = goal.0 - me.x;
         let dy = goal.1 - me.y;
@@ -284,33 +284,13 @@ fn long_range_dir(u: &Unit, me: &crowd::Agent, goal: (f32, f32)) -> (f32, f32) {
     let Some(gf) = u.guide.as_ref() else {
         return fallback;
     };
-    let cx = me.x.round() as i32;
-    let cy = me.y.round() as i32;
-    if !gf.in_(cx, cy) {
-        return fallback;
-    }
-    let here = gf.dist_at(cx, cy);
-    let mut best = here;
-    let mut bx = 0i32;
-    let mut by = 0i32;
-    for d in 0..8 {
-        let ax = cx + K_NEIGH_X[d];
-        let ay = cy + K_NEIGH_Y[d];
-        if !gf.in_(ax, ay) {
-            continue;
-        }
-        let s = gf.dist_at(ax, ay);
-        if s < best {
-            best = s;
-            bx = K_NEIGH_X[d];
-            by = K_NEIGH_Y[d];
-        }
-    }
-    if bx == 0 && by == 0 {
-        // 已经在场上最省的地方（碗底）：朝目标那个格收
-        return fallback;
-    }
-    let (dx, dy) = (bx as f32, by as f32);
-    let len = (dx * dx + dy * dy).sqrt();
-    (dx / len, dy / len)
+    let from=nav::Cell::new(me.x.round() as i32,me.y.round() as i32);
+    if !gf.valid_for(grid) || gf.dist_at(from.x,from.y)>=1e29 {return (0.0,0.0);}
+    let Some(next)=nav::flow_step(grid,gf,from) else {
+        let i=(from.y as usize)*gf.w as usize+from.x as usize;
+        return if gf.is_source.get(i).copied()==Some(1) {fallback} else {(0.0,0.0)};
+    };
+    let (dx,dy)=(next.x as f32-me.x,next.y as f32-me.y);
+    let len=dx.hypot(dy);
+    if len>1e-6 {(dx/len,dy/len)}else{(0.0,0.0)}
 }

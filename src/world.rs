@@ -351,8 +351,7 @@ use crate::crowd;
 use crate::nav::{self, CostGrid, FlowField, Footprint};
 
 /// 八个格邻居，顺序与 `nav::facing_octant` 一致（上游 world.cpp 的 kNeighX/Y）。
-pub(crate) const K_NEIGH_X: [i32; 8] = [1, -1, 0, 0, 1, 1, -1, -1];
-pub(crate) const K_NEIGH_Y: [i32; 8] = [0, 0, 1, -1, 1, -1, 1, -1];
+use crate::nav::{K_DIR_X as K_NEIGH_X,K_DIR_Y as K_NEIGH_Y};
 
 /// 机头要离下一步的朝向多近才允许迈步（256 = 一整圈）。转弯是在车**站的地方**转：车头按
 /// `turn_rate` 摆过来、进到 `kFaceTol` 以内才起步。设 0 就永远等不到（步进式转角到不了精确值），
@@ -643,6 +642,9 @@ pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<
         }
 
         if u.leg_t > 0.0 && u.path.len() >= 2 {
+            if nav::step_cost(nav,u.path[0],u.path[1]).is_none() {
+                u.path.clear();u.leg_t=0.0;u.vx=0.0;u.vy=0.0;continue;
+            }
             // 走腿中：把它推到对面格心。一步一旦开始就必须走完 —— 停在两格之间的身体不属于
             // 任何一格，既不能被超越也不能被跟随。
             let a = u.path[0];
@@ -711,30 +713,31 @@ pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<
                         // 最省的下坡邻居（不管交通）：等的时候车头就对着它，路一空就出发。
                         let mut dx = 0;
                         let mut dy = 0;
-                        let mut best_any = here;
+                        let mut best_any = f32::INFINITY;
                         // 以及本 tick 真正空闲的最省严格下坡邻居。
                         let mut bx = 0;
                         let mut by = 0;
-                        let mut best_free = here;
+                        let mut best_free = f32::INFINITY;
                         let mut have_free = false;
                         for d in 0..8 {
                             let ax = cx + K_NEIGH_X[d];
                             let ay = cy + K_NEIGH_Y[d];
                             let ti = cell_idx(ax, ay);
-                            if ti < 0 || !nav.walkable(ax, ay) {
+                            if ti < 0 || nav::step_cost(nav,Cell::new(cx,cy),Cell::new(ax,ay)).is_none() {
                                 continue;
                             }
                             let s = gf.dist_at(ax, ay);
-                            if s < best_any {
-                                best_any = s;
+                            let score=s+nav::step_cost(nav,Cell::new(cx,cy),Cell::new(ax,ay)).unwrap();
+                            if s < here && score < best_any {
+                                best_any = score;
                                 dx = K_NEIGH_X[d];
                                 dy = K_NEIGH_Y[d];
                             }
-                            if s < best_free
+                            if s < here && score < best_free
                                 && occupied[ti as usize] == 0
                                 && claimed[ti as usize] == 0
                             {
-                                best_free = s;
+                                best_free = score;
                                 bx = ax;
                                 by = ay;
                                 have_free = true;
@@ -767,7 +770,7 @@ pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<
                                     let ax = cx + K_NEIGH_X[d];
                                     let ay = cy + K_NEIGH_Y[d];
                                     let ti = cell_idx(ax, ay);
-                                    if ti < 0 || !nav.walkable(ax, ay) {
+                                    if ti < 0 || nav::step_cost(nav,Cell::new(cx,cy),Cell::new(ax,ay)).is_none() {
                                         continue;
                                     }
                                     if ax == u.last_step.x && ay == u.last_step.y {
@@ -805,7 +808,7 @@ pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<
                                     let ax = cx + K_NEIGH_X[d];
                                     let ay = cy + K_NEIGH_Y[d];
                                     let ti = cell_idx(ax, ay);
-                                    if ti < 0 || !nav.walkable(ax, ay) {
+                                    if ti < 0 || nav::step_cost(nav,Cell::new(cx,cy),Cell::new(ax,ay)).is_none() {
                                         continue;
                                     }
                                     if ax == u.last_step.x && ay == u.last_step.y {
@@ -823,7 +826,7 @@ pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<
                                         let nx = ax + K_NEIGH_X[d2];
                                         let ny = ay + K_NEIGH_Y[d2];
                                         let ni = cell_idx(nx, ny);
-                                        if ni < 0 || !nav.walkable(nx, ny) {
+                                        if ni < 0 || nav::step_cost(nav,Cell::new(ax,ay),Cell::new(nx,ny)).is_none() {
                                             continue;
                                         }
                                         if occupied[ni as usize] != 0
@@ -929,7 +932,7 @@ pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<
             u.dir_target = nav::facing_octant(u.path[1].x - u.path[0].x, u.path[1].y - u.path[0].y) as f32;
         }
         u.dir_angle = turn_toward(u.dir_angle, u.dir_target, u.turn_rate * dt);
-        aim_turret(&mut u, dt);
+        aim_turret(&mut u, nav, dt);
 
         // 闲下来了就撤销指令。
         //
@@ -988,7 +991,7 @@ pub fn update_sim_crowd(mut env: ResMut<SimEnv>, mut q: Query<(Entity, &mut Unit
 /// 有指令时：**瞄接下来要去的地方**（流场前瞻），不是瞄最初那个格子 —— 否则走过头就朝后看。
 /// 离目标 1.5 格内改瞄目标格，收尾要稳。
 /// 无指令时：以 turret_rate 的 20% 慢慢摆回车头方向，别硬僵在最后那个点上。
-pub(crate) fn aim_turret(u: &mut Unit, dt: f32) {
+pub(crate) fn aim_turret(u: &mut Unit, grid: &CostGrid, dt: f32) {
     // 「闲」只由 turret_idle 决定，绝不看 goal
     if u.goal.x < 0 || u.turret_idle {
         u.turret_angle = turn_toward(u.turret_angle, u.dir_angle, u.turret_rate * 0.2 * dt);
@@ -1000,7 +1003,7 @@ pub(crate) fn aim_turret(u: &mut Unit, dt: f32) {
 
     let mut aim: Option<f32> = None;
     if dist > 1.5 {
-        if let Some((ax, ay)) = flow_lookahead(u, 4) {
+        if let Some((ax, ay)) = flow_lookahead(u, grid, 4) {
             let bx = ax - u.cell_x;
             let by = ay - u.cell_y;
             if bx.abs() + by.abs() > 0.05 {
@@ -1026,38 +1029,17 @@ pub(crate) fn aim_turret(u: &mut Unit, dt: f32) {
 ///
 /// 做法：从当前格开始，每步挑 8 邻域里 `dist` 最小的格；挑不出更小的就停。
 /// 找不到场 / 已经在最省格上 → 返回 None，调用方退回原逻辑。
-fn flow_lookahead(u: &Unit, steps: i32) -> Option<(f32, f32)> {
+fn flow_lookahead(u: &Unit, grid:&CostGrid, steps: i32) -> Option<(f32, f32)> {
     let gf = u.guide.as_ref()?;
     let mut cx = u.cell_x.round() as i32;
     let mut cy = u.cell_y.round() as i32;
     if !gf.in_(cx, cy) {
         return None;
     }
-    let mut moved = false;
+    let mut moved=false;
     for _ in 0..steps.max(1) {
-        let here = gf.dist_at(cx, cy);
-        let mut best = here;
-        let mut bx = 0;
-        let mut by = 0;
-        for d in 0..8 {
-            let ax = cx + K_NEIGH_X[d];
-            let ay = cy + K_NEIGH_Y[d];
-            if !gf.in_(ax, ay) {
-                continue;
-            }
-            let s = gf.dist_at(ax, ay);
-            if s < best {
-                best = s;
-                bx = K_NEIGH_X[d];
-                by = K_NEIGH_Y[d];
-            }
-        }
-        if bx == 0 && by == 0 {
-            break;  // 到了最省的地方（碗底）
-        }
-        cx += bx;
-        cy += by;
-        moved = true;
+        let Some(next)=nav::flow_step(grid,gf,Cell::new(cx,cy)) else {break;};
+        cx=next.x;cy=next.y;moved=true;
     }
     if moved {
         Some((cx as f32, cy as f32))
@@ -1094,7 +1076,7 @@ mod tests {
         // 单位在碗底左边 6 格
         u.cell_x = 2.0;
         u.cell_y = 8.0;
-        let (ax, ay) = flow_lookahead(&u, 4).expect("应该能前瞻");
+        let (ax, ay) = flow_lookahead(&u, &g, 4).expect("应该能前瞻");
         let d_now = ((2.0f32 - 8.0).powi(2) + (8.0 - 8.0f32).powi(2)).sqrt();
         let d_ahead = ((ax - 8.0).powi(2) + (ay - 8.0).powi(2)).sqrt();
         assert!(d_ahead < d_now, "前瞻点 {ax},{ay} 没有更靠近碗底（{d_ahead:.2} vs {d_now:.2}）");

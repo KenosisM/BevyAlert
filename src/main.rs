@@ -34,6 +34,8 @@ mod world;
 
 #[cfg(test)]
 mod simulation_tests;
+#[cfg(test)]
+mod nav_properties;
 
 use std::time::Instant;
 

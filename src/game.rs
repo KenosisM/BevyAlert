@@ -789,7 +789,9 @@ pub fn run(args: Vec<String>) {
 
     // --- 出生点：在 from 附近用编队格铺开 --------------------------------------------
     let start_default = Cell::new(gw / 4 + 2, gh / 4 + 2);
-    let start = play::nearest_usable(&raw_grid, from.unwrap_or(start_default));
+    let Some(start)=play::nearest_usable(&nav_grid,from.unwrap_or(start_default)) else {
+        eprintln!("no legal spawn cell");return;
+    };
     let mut spawn_cells = nav::formation_cells(&nav_grid, &footprint, start, units_n);
     if spawn_cells.is_empty() {
         spawn_cells.push(start);

@@ -401,14 +401,7 @@ pub fn resolve_position(
     from: (f32, f32),
     to: (f32, f32),
 ) -> (f32, f32) {
-    let ok = |x: f32, y: f32| -> bool {
-        let cx = x.round() as i32;
-        let cy = y.round() as i32;
-        if cx < 0 || cy < 0 || cx >= grid.w || cy >= grid.h {
-            return false;
-        }
-        grid.walkable(cx, cy)
-    };
+    let ok=|x:f32,y:f32| crate::nav::segment_allowed(grid,from,(x,y));
     if ok(to.0, to.1) {
         return to;
     }

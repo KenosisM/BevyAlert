@@ -22,23 +22,15 @@ pub struct Selection(pub Vec<Entity>);
 
 /// 一次指令落在障碍上时，就近找一格可用的：点在障碍上仍然要让部队尽量靠近，而不是什么都不做。
 /// 上游签名带一个用不上的 `Footprint`；这里省掉。
-pub fn nearest_usable(g: &CostGrid, want: Cell) -> Cell {
-    if g.in_(want.x, want.y) && g.walkable(want.x, want.y) {
-        return want;
-    }
-    for r in 1..=64i32 {
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx.abs().max(dy.abs()) != r {
-                    continue;
-                }
-                if g.in_(want.x + dx, want.y + dy) && g.walkable(want.x + dx, want.y + dy) {
-                    return Cell::new(want.x + dx, want.y + dy);
-                }
-            }
-        }
-    }
-    want
+pub fn nearest_usable(g:&CostGrid,want:Cell)->Option<Cell> {
+    if !g.valid() || !g.in_(want.x,want.y) {return None;}
+    if g.walkable(want.x,want.y) {return Some(want);}
+    let mut best=None;let mut best_dist=i64::MAX;
+    for y in 0..g.h {for x in 0..g.w {
+        if !g.walkable(x,y) {continue;}
+        let dx=(x-want.x) as i64;let dy=(y-want.y) as i64;let d=dx*dx+dy*dy;
+        if d<best_dist {best_dist=d;best=Some(Cell::new(x,y));}
+    }}best
 }
 
 /// RA2 的移动指令：点一处，整群朝它掉下去。这一群是被丢进碗里的一把球 —— 点击处是碗底的中心，
@@ -47,18 +39,20 @@ pub fn nearest_usable(g: &CostGrid, want: Cell) -> Cell {
 /// 返回真正拿到路线的单位数（上游 `pathed`）。用 exclusive 形式（`&mut World`）是因为它要
 /// 按选中表逐车写 `guide/goal/...`，而车位又是 ECS 实体。
 pub fn issue_order_at(world: &mut World, dest: Cell) -> usize {
-    let sel: Vec<Entity> = world.resource::<Selection>().0.clone();
-    if sel.is_empty() {
-        return 0;
-    }
-
     // 取一份导航网格（侵蚀过、单位真正看到的那张）与足迹。指令不频繁，克隆一次无所谓。
     let (nav, footprint) = {
         let env = world.resource::<SimEnv>();
         (env.nav.clone(), env.footprint)
     };
+    if !nav.valid() || footprint.w<=0 || footprint.h<=0 {return 0;}
+    let mut sel:Vec<_>=world.resource::<Selection>().0.iter().copied().filter(|e| {
+        world.get::<Unit>(*e).is_some_and(|u|u.on_ground&&u.cell_x.is_finite()&&u.cell_y.is_finite()
+            &&nav.walkable(u.cell_x.round() as i32,u.cell_y.round() as i32))
+    }).collect();
+    sel.sort_by_key(|e|world.get::<Unit>(*e).unwrap().idx);sel.dedup();
+    if sel.is_empty(){return 0;}
 
-    let dest = nearest_usable(&nav, dest);
+    let Some(dest)=nearest_usable(&nav,dest) else {return 0;};
 
     // 碗底的大小**取自这一群**：它恰好装下与车数相同的格，于是「填满」与「停下」是同一件事 ——
     // 最后一辆进来后没有空格剩下，整群就停下，没有任何人为的刹车。宽一格就永远静不下来。
@@ -88,7 +82,7 @@ pub fn issue_order_at(world: &mut World, dest: Cell) -> usize {
         return 0;
     }
     let shared = Arc::new(shared);
-    let command_id = world.resource_mut::<SimEnv>().runtime.allocate_command();
+    let mut command_id=None;
     let mut pathed = 0usize;
     for (i, &e) in sel.iter().enumerate() {
         let here = {
@@ -100,17 +94,15 @@ pub fn issue_order_at(world: &mut World, dest: Cell) -> usize {
         }
         let mut reached = Cell::default();
         let mut route: Vec<Cell> = Vec::new();
-        let goal = if path_to_nearest_source(&nav, &shared, here, &mut reached, &mut route) {
-            reached
-        } else {
-            dest
-        };
+        if !path_to_nearest_source(&nav,&shared,here,&mut reached,&mut route) {continue;}
+        let goal=reached;
+        let id=*command_id.get_or_insert_with(||world.resource_mut::<SimEnv>().runtime.allocate_command());
 
         let mut u = world.get_mut::<Unit>(e).unwrap();
         u.guide = Some(shared.clone());
         // 它自己那一格碗底：顺着共享场最近的播种格。它只是标记指向哪儿，车的运动是跟场走的。
         u.goal = goal;
-        u.command_id = Some(command_id);
+        u.command_id = Some(id);
         u.start_delay = if sel.len() == 1 {
             0.0
         } else {
