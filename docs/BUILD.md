@@ -99,6 +99,28 @@ $bevyAlertCargo = "$bevyAlertBin\cargo.exe"
 
 实际游戏需要用户本地提供合法的 EA / Westwood 资产，并在 `rulesmd.ini` 配置 `GameDir` 和 `Map`；这些资产不在 GitHub，也不是无头 nav / crowd 单元测试的输入。当前配置仍为 `TickHz=60`、`Crowd=0`。中文界面还使用 Windows 的 `C:/Windows/Fonts/simsun.ttc`。构建和单元测试通过不等于已验证真实地图或 GPU 窗口运行。
 
+当前默认启动配置使用工程目录下的本地资源：
+
+```ini
+[Launch]
+Map=assets/hillbtwn.map
+GameDir=RedAlert2/GameMD
+```
+
+`GameDir` 指向直接存放 `ra2.mix`、`ra2md.mix` 等归档的 `GameMD` 子目录，不能只填外层 `RedAlert2`。`启动.bat` 会先切换到工程根目录，因此这些相对路径适用于双击启动；在终端直接运行 exe 时也应以工程根为工作目录。Git只保存路径配置，`/RedAlert2/` 和 `/assets` 均由 `.gitignore` 排除；从GitHub恢复工程后，需自行放回本地资源。
+
+地图、相机和起终点沿用项目原有配置。若本地缺少 `assets/hillbtwn.map`，可从游戏资源包提取；已有地图时保留原文件。在工程根目录执行：
+
+```powershell
+if (-not (Test-Path -LiteralPath 'assets/hillbtwn.map')) {
+    New-Item -ItemType Directory -Force -Path 'assets' | Out-Null
+    & '.\target\debug\ra2engine.exe' dump 'RedAlert2/GameMD' 'hillbtwn.map' 'assets/hillbtwn.map'
+}
+& '.\target\debug\ra2engine.exe' costgrid 'assets/hillbtwn.map' 'RedAlert2/GameMD' --zone Track
+```
+
+`costgrid`用于检查资源读取和地图解析；窗口画面、单位移动与停车需分别实际验证。
+
 ## 验证基线
 
 验证日期：2026-10-30 至 2026-10-31（Asia/Shanghai）。机器为 i5-1235U、16 GB 内存，工具版本见上表。
