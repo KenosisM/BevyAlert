@@ -49,6 +49,7 @@
 | `world.rs` | 模拟世界 / `GroundField` |
 | `nav.rs` | 寻路 / 重力碗（26 个单测） |
 | `simulation.rs` / `nav_headless.rs` | 窗口与无头共用的固定步长核心、采样事件和可复现输入；见 [模拟入口](SIMULATION.md) |
+| `nav_scenario.rs` / `nav_demo.rs` | 四色四群同步演示、场景配置与机器可读基线；见 [四群演示](NAV_DEMO.md) |
 | `play.rs` | 指令链 |
 | `shp.rs` `hva.rs` `vxl.rs` `vxl_normals.rs` `voxel_mesh.rs` `vxl_gpu.rs` | 单位与建筑素材 → mesh |
 | `lighting.rs` | 调色板按高度 / 太阳重算 |

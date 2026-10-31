@@ -11,7 +11,9 @@ mod mapfile;
 mod mat4;
 mod mix;
 mod nav;
+mod nav_demo;
 mod nav_headless;
+mod nav_scenario;
 mod png_out;
 mod play;
 mod ramp;
@@ -72,6 +74,13 @@ struct CellPos {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("nav-demo") {
+        if let Err(message) = nav_demo::run(&args[2..]) {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.get(1).map(|s| s.as_str()) == Some("nav-headless") {
         if let Err(message) = nav_headless::run(&args[2..]) {
             eprintln!("{message}");
