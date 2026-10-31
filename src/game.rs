@@ -838,6 +838,7 @@ pub fn run(args: Vec<String>) {
         // 已知问题：脚本指令下单位可能不动。改 true 就切回新系统。
         use_crowd: cfg.crowd,
         velocity_mode: crate::crowd::VelocityMode::Orca,
+        traffic: crate::traffic::Traffic::default(),
         pressure: crate::crowd::Pressure::default(),
         crowd_params: crate::crowd::Params::default(),
         since_pressure: 0,

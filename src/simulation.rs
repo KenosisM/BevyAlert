@@ -48,6 +48,7 @@ pub struct PhaseTimes {
     pub total: Duration,
     pub spatial: Duration,
     pub formation: Duration,
+    pub traffic:Duration,
 }
 
 /// A sampled event, kept in memory. Sampling performs no file or console I/O.
@@ -115,6 +116,12 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     let formation_time=total.elapsed();
     let dt = env.runtime.dt();
     let orca=env.velocity_mode==crowd::VelocityMode::Orca;
+    let traffic_start=Instant::now();
+    if orca {env.traffic.update(&env.nav,units,env.tick,dt);}
+    for u in units.iter_mut() {let decision=env.traffic.decision(u.idx);u.traffic_phase=decision.phase;u.traffic_hold=decision.cap==Some(0.0);
+        if decision.freeze_target {if let Some(t)=&mut u.parking {t.frozen=true;}}
+    }
+    let traffic_time=traffic_start.elapsed();
     env.runtime.orca=crowd::OrcaReport::default();
     let phase = Instant::now();
     // ---- 1. 快照：位置 / 路权 / 半径 ----------------------------------------
@@ -150,7 +157,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             speed: u.speed,
             priority: -remaining,
             radius: u.parking.as_ref().map_or(env.crowd_params.radius_default(),|t|t.radius),
-            settled: settled || !u.on_ground,
+            settled: settled || !u.on_ground||env.traffic.decision(u.idx).cap==Some(0.0),
             vx: u.vx,
             vy: u.vy,
             max_accel: u.speed * 6.0,
@@ -189,6 +196,11 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             neighbors:&mut buffers.idle_neighbors,owner:u.idx,radius:agents[i].radius,max_radius};
         let local=crate::formation::direction(u,bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),env.tick,&mut query,&mut buffers.local_routes);
         let mut dir = if let Some(v)=local {(v.x,v.y)}else{long_range_dir(&env.nav,u,&snapshot[i],goal)};
+        let traffic=env.traffic.decision(u.idx);
+        if orca {if let Some(point)=traffic.point {
+            let here=bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y);
+            let v=env.traffic.assembly_direction(u.idx,u.command_id.map_or(0,|c|c.0),here,env.tick,&mut query,&mut buffers.local_routes).unwrap_or_else(||(point-here).normalize_or_zero());dir=(v.x,v.y);
+        }}
         // 保留原有切向逃逸，直到显式停滞恢复接管。
         if !orca&&u.escape_ticks > 0&&!u.parking.as_ref().is_some_and(|t|t.local_active) {
             dir = crowd::rotate90(dir, u.escape_side);
@@ -198,12 +210,12 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
         }
         let goal=crate::formation::motion_goal(u);let goal=(goal.x,goal.y);
-        let preferred=if let Some(t)=&u.parking {
+        let preferred=if orca&&traffic.phase==crate::traffic::Phase::Assembling {Some(u.speed)}else if let Some(t)=&u.parking {
             let remaining=t.remaining_distance(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),bevy::math::Vec2::new(goal.0,goal.1));
             Some(u.arrival.preferred_speed(t,remaining,u.speed,agents[i].max_accel,dt))
         }else{None};
         if orca {
-            let cap=preferred.unwrap_or(u.speed).min(u.speed).max(0.0);
+            let cap=preferred.unwrap_or(u.speed).min(u.speed).min(traffic.cap.unwrap_or(u.speed)).max(0.0);
             buffers.objectives[i]=bevy::math::Vec2::new(dir.0,dir.1).normalize_or_zero()*cap;
             buffers.caps[i]=cap;continue;
         }
@@ -236,10 +248,10 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,
             crowd::AGENT_HORIZON,env.crowd_params.neighbor_radius.max(1.2));
         buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
-        let wanted=crowd::passing_preference(i,snapshot,&buffers.neighbors,&buffers.objectives);
+        let wanted=crowd::passing_preference_unfolding(i,snapshot,&buffers.neighbors,&buffers.objectives,u.traffic_phase==crate::traffic::Phase::Assembling);
         let objective=crowd::smooth_preferred(u.preferred_velocity,wanted,snapshot[i].max_accel,dt,buffers.caps[i]);
         u.preferred_velocity=Some(objective);
-        let v=buffers.orca.velocity(i,snapshot,&buffers.neighbors,objective,buffers.caps[i],dt,&mut env.runtime.orca);
+        let v=buffers.orca.velocity_with_barrier(i,snapshot,&buffers.neighbors,objective,buffers.caps[i],dt,&mut env.runtime.orca,env.traffic.decision(u.idx).barrier);
         agents[i].x=snapshot[i].x+v.x*dt;agents[i].y=snapshot[i].y+v.y*dt;
     }}
 
@@ -347,7 +359,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         let times = PhaseTimes { snapshot: snapshot_time, pressure: pressure_time,
             velocity: velocity_time, contact: contact_time, writeback: phase.elapsed(),
             total: total.elapsed(),spatial:env.runtime.spatial_stats.build_time+env.runtime.spatial_stats.query_time,
-            formation:formation_time };
+            formation:formation_time,traffic:traffic_time };
         env.runtime.last_sample = Some(TickSample {
             tick: env.tick, seed: env.runtime.seed,
             units: units.iter().map(|u| UnitSample {

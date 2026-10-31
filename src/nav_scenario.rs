@@ -201,11 +201,12 @@ pub struct Metrics {
     pub entry_refinements:u64,
     pub arrived:Option<usize>,pub arriving:usize,pub waiting:[usize;4],pub replanning:usize,pub failed:usize,pub max_parked_drift:f32,
     pub orca:crate::crowd::OrcaReport,
+    pub traffic:crate::traffic::Report,pub traffic_us:u128,
 }
 impl Metrics {
     pub fn arrival_text(&self)->String {self.arrived.map_or("not-ready".into(),|v|v.to_string())}
     pub fn waiting_text(&self)->String {if self.arrived.is_none(){return "not-ready".into();}
-        format!("stopped:{}|space:{}|entrance:{}|path:{}|replan:{}",self.waiting[0],self.waiting[1],self.waiting[2],self.waiting[3],self.replanning)}
+        format!("stopped:{}|space:{}|entrance:{}|path:{}|replan:{}|traffic:{}",self.waiting[0],self.waiting[1],self.waiting[2],self.waiting[3],self.replanning,self.traffic.waiting)}
 }
 
 pub fn metrics(world:&mut World) -> Metrics {
@@ -215,6 +216,7 @@ pub fn metrics(world:&mut World) -> Metrics {
     let contacts=&env.runtime.contacts;
     m.spatial=env.runtime.spatial_stats.clone();
     m.orca=env.runtime.orca.clone();
+    m.traffic=env.traffic.report.clone();
     m.reserved=env.reservations.claims.len();m.planning_us=env.reservations.planning_time.as_micros();
     m.entry_refinements=env.reservations.entry_refinements;
     m.collision_ready=env.use_crowd&&env.tick>0;
@@ -246,6 +248,7 @@ pub fn metrics(world:&mut World) -> Metrics {
         for v in [u.arrival.motion.tag() as u64,u.arrival.command as u64,u.arrival.quiet_seconds.to_bits()] {
             digest=(digest^v).wrapping_mul(0x100000001b3);
         }
+        digest=(digest^u.traffic_phase as u64).wrapping_mul(0x100000001b3);
         if !m.collision_ready {for other in &units[i+1..] {
             m.overlap_end=m.overlap_end.max((env.crowd_params.radius_default()*2.0-(u.cell_x-other.cell_x).hypot(u.cell_y-other.cell_y)).max(0.0));
         }}
@@ -258,6 +261,7 @@ pub fn metrics(world:&mut World) -> Metrics {
         m.total_us=t.total.as_micros();m.snapshot_us=t.snapshot.as_micros();m.pressure_us=t.pressure.as_micros();
         m.velocity_us=t.velocity.as_micros();m.contact_us=t.contact.as_micros();m.writeback_us=t.writeback.as_micros();
         m.formation_us=t.formation.as_micros();
+        m.traffic_us=t.traffic.as_micros();
     }
     m
 }
@@ -266,6 +270,7 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
     use std::fmt::Write;
     if let Some(parent)=path.parent().filter(|p|!p.as_os_str().is_empty()) { fs::create_dir_all(parent).map_err(|e|e.to_string())?; }
     let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops,spatial_us,neighbor_peak,bucket_peak,neighbor_queries,neighbor_entries,pair_candidates,neighbor_truncated,dense_bucket_events,large_bounds,fallback_queries,reservation_count,frozen_targets,waiting_space,waiting_entrance,blocked_near_path,command_plan_us,formation_us,entry_refinements,arriving,stopped,replanning,failed,max_parked_drift,orca_solved,orca_infeasible,orca_invalid,orca_emergency,orca_static_constraints,orca_unit_constraints,orca_full_responsibility,orca_neighbor_truncated,orca_contact_fallback,orca_max_violation\n");
+    csv.pop();csv.push_str(",traffic_us,traffic_passing,traffic_waiting,traffic_admitted,traffic_gates,traffic_batches,traffic_switches,traffic_max_wait,traffic_incompatible,traffic_unavailable\n");
     for m in samples {
         let timing=|v:u128|if m.timing_ready {v.to_string()} else {"not-ready".into()};
         let contacts=if m.collision_ready {format!("{:.6},{},{},{},{},{}",m.swept_penetration,
@@ -279,6 +284,7 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
         let o=&m.orca;
         let arrival=format!("{},{},{},{},{:.9},{},{},{},{},{},{},{},{},{},{:.9}",m.arriving,m.waiting[0],m.replanning,m.failed,m.max_parked_drift,
             o.solved,o.infeasible,o.invalid,o.emergency,o.static_constraints,o.unit_constraints,o.full_responsibility,o.truncated,o.contact_fallback,o.max_violation);
+        let t=&m.traffic;let arrival=format!("{arrival},{},{},{},{},{},{},{},{:.6},{},{}",timing(m.traffic_us),t.passing,t.waiting,t.admitted,t.gates,t.batches,t.switches,t.max_wait,t.incompatible,t.unavailable);
         writeln!(csv,"{},{:.6},{},{},{},{},{},{:.6},{:.6},{},{},{},{},{},{},{},{:016x},{},{},{},{},{}",
             m.tick,m.tick as f64/TICK_HZ,m.active,m.moved,m.arrival_text(),m.waiting_text(),m.legacy_stalled,m.max_still_seconds,m.overlap_end,
             m.bad_centers,timing(m.total_us),timing(m.snapshot_us),timing(m.pressure_us),timing(m.velocity_us),timing(m.contact_us),timing(m.writeback_us),m.digest,
@@ -288,12 +294,16 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
     fs::write(path.with_extension("scene.ini"),config.encode()).map_err(|e|e.to_string())?;
     let mut units:Vec<_>=world.query::<&Unit>().iter(world).cloned().collect();units.sort_by_key(|u|u.idx);
     let mut snapshot=String::from("id,group,command,x,y,vx,vy,goal_x,goal_y,still_ticks,stall_ticks,parking_x,parking_y,parking_valid,parking_frozen,target_block,motion,command_status,quiet_seconds,parked_drift\n");
+    snapshot.pop();snapshot.push_str(",traffic_phase\n");
     for u in units {
         let parking=u.parking.as_ref().map_or("none,none,false,false,none".into(),|t|format!("{:.9},{:.9},{},{},{:?}",t.position.x,t.position.y,t.valid,t.frozen,t.blocked));
-        writeln!(snapshot,"{},{},{},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{},{:?},{:?},{:.9},{:.9}",u.idx,
+        writeln!(snapshot,"{},{},{},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{},{:?},{:?},{:.9},{:.9},{:?}",u.idx,
         u.idx as usize/config.per_group,u.command_id.map_or(0,|c|c.0),u.cell_x,u.cell_y,u.vx,u.vy,
-        u.goal.x,u.goal.y,u.still_ticks,u.stall_ticks,parking,u.arrival.motion,crate::arrival::status(&u),u.arrival.quiet_seconds,u.arrival.max_drift).unwrap(); }
+        u.goal.x,u.goal.y,u.still_ticks,u.stall_ticks,parking,u.arrival.motion,crate::arrival::status(&u),u.arrival.quiet_seconds,u.arrival.max_drift,u.traffic_phase).unwrap(); }
     fs::write(path.with_extension("units.csv"),snapshot).map_err(|e|e.to_string())?;
+    let mut events=String::from("tick,region,command,unit,event,side\n");
+    for e in &world.resource::<SimEnv>().traffic.events {writeln!(events,"{},{},{},{},{},{}",e.tick,e.region,e.command,e.unit,e.kind,e.side).unwrap();}
+    fs::write(path.with_extension("traffic.csv"),events).map_err(|e|e.to_string())?;
     Ok(())
 }
 

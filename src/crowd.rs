@@ -41,6 +41,10 @@ pub struct OrcaWorkspace {
 impl OrcaWorkspace {
     pub fn velocity(&mut self,i:usize,agents:&[Agent],neighbors:&[usize],preferred:bevy::math::Vec2,
         cap:f32,dt:f32,report:&mut OrcaReport)->bevy::math::Vec2 {
+        self.velocity_with_barrier(i,agents,neighbors,preferred,cap,dt,report,None)
+    }
+    pub fn velocity_with_barrier(&mut self,i:usize,agents:&[Agent],neighbors:&[usize],preferred:bevy::math::Vec2,
+        cap:f32,dt:f32,report:&mut OrcaReport,barrier:Option<crate::orca::HalfPlane>)->bevy::math::Vec2 {
         use crate::orca::{self,Responsibility,SolveStatus};
         use bevy::math::DVec2;
         let a=agents[i];let me=orca::Agent{id:i as u64,position:DVec2::new(a.x as f64,a.y as f64),
@@ -49,6 +53,7 @@ impl OrcaWorkspace {
         if self.boundaries.constraints(me.position,me.velocity,me.radius,a.speed as f64,OBSTACLE_HORIZON,&mut self.planes).is_err() {
             report.invalid+=1;return bevy::math::Vec2::ZERO;
         }
+        if let Some(plane)=barrier {self.planes.push(plane);}
         let hard=self.planes.len();report.static_constraints+=hard;
         for &j in neighbors {if j==i {continue;}let b=agents[j];
             let other=orca::Agent{id:j as u64,position:DVec2::new(b.x as f64,b.y as f64),
@@ -79,11 +84,14 @@ pub fn smooth_preferred(previous:Option<bevy::math::Vec2>,wanted:bevy::math::Vec
 /// Equal parallel objectives have zero relative velocity and are left alone.
 /// This is a preference only: walls and every agent constraint still participate.
 pub fn passing_preference(i:usize,agents:&[Agent],neighbors:&[usize],wanted:&[bevy::math::Vec2])->bevy::math::Vec2 {
+    passing_preference_unfolding(i,agents,neighbors,wanted,false)
+}
+pub fn passing_preference_unfolding(i:usize,agents:&[Agent],neighbors:&[usize],wanted:&[bevy::math::Vec2],unfolding:bool)->bevy::math::Vec2 {
     use bevy::math::Vec2;
     let a=agents[i];let v=wanted[i];let cap=v.length();if cap==0.0 {return v;}
     let mut closest=AGENT_HORIZON;let mut side=Vec2::ZERO;
     for &j in neighbors {if i==j {continue;}let b=agents[j];let p=Vec2::new(b.x-a.x,b.y-a.y);
-        if a.group.is_some()&&a.group==b.group {continue;}
+        if !unfolding&&a.group.is_some()&&a.group==b.group {continue;}
         let relative=v-wanted[j];let speed_sq=relative.length_squared();
         if speed_sq<1e-8||v.dot(p)<=0.0 {continue;}
         let t=p.dot(relative)/speed_sq;

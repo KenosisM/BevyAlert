@@ -278,7 +278,7 @@ pub fn maintain(env:&mut crate::world::SimEnv,units:&mut [crate::world::Unit]) {
     let active:BTreeSet<_>=units.iter().filter_map(|u|u.command_id.map(|c|c.0)).collect();env.buffers.local_routes.prune(&active);
     env.buffers.idle_index.begin_tick();env.buffers.idle_bodies.clear();
     env.buffers.idle_bodies.extend(units.iter().filter(|u|u.on_ground&&(u.goal.x<0||u.parking.as_ref().is_some_and(|t|
-        u.vx.hypot(u.vy)<=0.05&&(position(u).distance(t.position)<=POINT_REACH_RADIUS||u.arrival.held()||t.blocked==Some(TargetBlock::Entrance)||u.contact_hold))))
+        u.vx.hypot(u.vy)<=0.05&&(position(u).distance(t.position)<=POINT_REACH_RADIUS||u.arrival.held()||t.blocked==Some(TargetBlock::Entrance)||u.contact_hold||u.traffic_hold))))
         .map(|u|body(u,env.crowd_params.radius_default())));
     let idle_radius=env.buffers.idle_bodies.iter().map(|b|b.radius).fold(0.0f32,f32::max);
     env.buffers.idle_bounds.clear();env.buffers.idle_bounds.extend(env.buffers.idle_bodies.iter().map(|b|Aabb::point(b.position)));
