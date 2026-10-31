@@ -43,9 +43,7 @@ exit /b 0
 echo.
 echo   找不到 %EXE%，先编译一次（首次要几分钟，请耐心等）
 echo.
-where cargo >nul 2>nul
-if errorlevel 1 set "PATH=C://Users//HYMOD//.rustup//toolchains//stable-x86_64-pc-windows-msvc//bin;%PATH%"
-cargo build
+call "%~dp0build.cmd"
 if errorlevel 1 (
   echo.
   echo   [x] 编译失败，请把上面的报错发出来。
