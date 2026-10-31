@@ -48,6 +48,7 @@
 | `debugview.rs` | 逻辑模式覆盖层：悬停黄框 / 信息面板 / 俯视按钮 |
 | `world.rs` | 模拟世界 / `GroundField` |
 | `nav.rs` | 寻路 / 重力碗（26 个单测） |
+| `simulation.rs` / `nav_headless.rs` | 窗口与无头共用的固定步长核心、采样事件和可复现输入；见 [模拟入口](SIMULATION.md) |
 | `play.rs` | 指令链 |
 | `shp.rs` `hva.rs` `vxl.rs` `vxl_normals.rs` `voxel_mesh.rs` `vxl_gpu.rs` | 单位与建筑素材 → mesh |
 | `lighting.rs` | 调色板按高度 / 太阳重算 |

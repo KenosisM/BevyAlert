@@ -88,6 +88,7 @@ pub fn issue_order_at(world: &mut World, dest: Cell) -> usize {
         return 0;
     }
     let shared = Arc::new(shared);
+    let command_id = world.resource_mut::<SimEnv>().runtime.allocate_command();
     let mut pathed = 0usize;
     for (i, &e) in sel.iter().enumerate() {
         let here = {
@@ -109,6 +110,7 @@ pub fn issue_order_at(world: &mut World, dest: Cell) -> usize {
         u.guide = Some(shared.clone());
         // 它自己那一格碗底：顺着共享场最近的播种格。它只是标记指向哪儿，车的运动是跟场走的。
         u.goal = goal;
+        u.command_id = Some(command_id);
         u.start_delay = if sel.len() == 1 {
             0.0
         } else {

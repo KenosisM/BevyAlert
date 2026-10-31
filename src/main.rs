@@ -11,11 +11,13 @@ mod mapfile;
 mod mat4;
 mod mix;
 mod nav;
+mod nav_headless;
 mod png_out;
 mod play;
 mod ramp;
 mod rules;
 mod shp;
+mod simulation;
 mod terrain;
 mod theater;
 mod tilefix;
@@ -27,6 +29,9 @@ mod vxl;
 mod vxl_gpu;
 mod vxl_normals;
 mod world;
+
+#[cfg(test)]
+mod simulation_tests;
 
 use std::time::Instant;
 
@@ -67,6 +72,13 @@ struct CellPos {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("nav-headless") {
+        if let Err(message) = nav_headless::run(&args[2..]) {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.get(1).map(|s| s.as_str()) == Some("view") {
         viewer::run(args[2..].to_vec());
         return;

@@ -351,8 +351,8 @@ use crate::crowd;
 use crate::nav::{self, CostGrid, FlowField, Footprint};
 
 /// 八个格邻居，顺序与 `nav::facing_octant` 一致（上游 world.cpp 的 kNeighX/Y）。
-const K_NEIGH_X: [i32; 8] = [1, -1, 0, 0, 1, 1, -1, -1];
-const K_NEIGH_Y: [i32; 8] = [0, 0, 1, -1, 1, -1, 1, -1];
+pub(crate) const K_NEIGH_X: [i32; 8] = [1, -1, 0, 0, 1, 1, -1, -1];
+pub(crate) const K_NEIGH_Y: [i32; 8] = [0, 0, 1, -1, 1, -1, 1, -1];
 
 /// 机头要离下一步的朝向多近才允许迈步（256 = 一整圈）。转弯是在车**站的地方**转：车头按
 /// `turn_rate` 摆过来、进到 `kFaceTol` 以内才起步。设 0 就永远等不到（步进式转角到不了精确值），
@@ -365,10 +365,12 @@ const K_ROLL_BUDGET: i32 = 999;
 
 /// 一辆车 —— 上游 `Entity` 的**寻路那一半**。
 /// 渲染字段（pix/pal/zbuf/rgba/art/anchor/mode/…）不搬：由 Bevy 侧承担。
-#[derive(Component, Debug)]
+#[derive(Component, Clone, Debug)]
 pub struct Unit {
     /// 稳定索引：只用来把遍历顺序钉死（`occupied` 里存的 tag 是「排序位置 + 1」）。
     pub idx: i32,
+    /// Shared command identity; None before the first order.
+    pub command_id: Option<crate::simulation::CommandId>,
 
     pub on_ground: bool,
     /// 位置（格单位）。上游 onGround 实体用 (cellX,cellY)、非地面用 (x,y)；这里统一成格坐标。
@@ -429,6 +431,7 @@ impl Default for Unit {
     fn default() -> Self {
         Unit {
             idx: 0,
+            command_id: None,
             on_ground: true,
             cell_x: 0.0,
             cell_y: 0.0,
@@ -473,6 +476,7 @@ pub struct SimEnv {
     /// 本 tick 开始时各格的占用（tag = 排序位置 + 1；0 = 空）
     pub occupied: Vec<i32>,
     pub tick: u64,
+    pub runtime: crate::simulation::Runtime,
 
     // ---- 连续运动层（路线 C）------------------------------------------------
     /// true = 走 `update_sim_crowd`（互斥力 + 路权 + 压力场），false = 走旧的离散重力碗
@@ -492,6 +496,7 @@ impl Default for SimEnv {
             footprint: Footprint::default(),
             occupied: Vec::new(),
             tick: 0,
+            runtime: crate::simulation::Runtime::default(),
             use_crowd: true,
             pressure: crowd::Pressure::default(),
             crowd_params: crowd::Params::default(),
@@ -502,7 +507,7 @@ impl Default for SimEnv {
 
 /// 把 `a` 朝 `t` 转最多 `max_step` 个游戏单位，走 256 圈上的短路。这就是把一次离散的转向
 /// 变成看得见的过程的东西。
-fn turn_toward(a: f32, t: f32, max_step: f32) -> f32 {
+pub(crate) fn turn_toward(a: f32, t: f32, max_step: f32) -> f32 {
     let mut d = (t - a) % 256.0;
     if d > 128.0 {
         d -= 256.0;
@@ -542,6 +547,7 @@ fn angle_gap(a: f32, t: f32) -> f32 {
 /// 所以先把顺序取出来（按 `idx` 排序），再按序 `get_mut`；`occupied`/`claimed`/`committed`
 /// 都是本地缓冲，邻居的 `roll` 用一份镜像读，于是不需要跨实体借用。
 pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<(Entity, &mut Unit)>) {
+    if env.use_crowd { return; }
     let dt = time.delta_secs();
 
     let mut order: Vec<(i32, Entity)> = q.iter_mut().map(|(e, u)| (u.idx, e)).collect();
@@ -964,232 +970,25 @@ pub fn update_sim(time: Res<Time<Fixed>>, mut env: ResMut<SimEnv>, mut q: Query<
 }
 
 
-// ============================================================================ 连续运动（路线 C）
-//
-// 与 `update_sim` 并存的第二套运动系统。开关是 `SimEnv::use_crowd`。
-// 它**不**读 `occupied` / `claimed` / `committed`，也不再有「腿」「roll」「动量」——
-// 那三样正是调研里那三条硬闸门。位置是连续量，速度由 crowd::step_agent 给出。
-//
-// 长程方向仍取自 `Unit::guide`（共享流场）：取 8 邻域里 dist 最小的那个格，朝它走。
-// 这保住了「一张场、流线不相交」的好处，同时短程不再被格子锁死。
-/// 诊断：设 `RA2_NAV_LOG=1` 时把每帧的汇总写进 `nav_debug.log`（前 600 帧）。
-/// 用来回答「单位为什么不动」这类问题，别靠猜。
-fn nav_debug(tick: u64, total: usize, with_guide: usize, settled: usize, moved: usize, max_disp: f32) {
-    use std::io::Write;
-    // 前 5 帧无条件写：先确认系统到底进没进来；之后只在 RA2_NAV_LOG=1 时写。
-    let forced = tick < 5;
-    if tick > 600 || (!forced && std::env::var("RA2_NAV_LOG").ok().as_deref() != Some("1")) {
-        return;
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("nav_debug.log") {
-        let _ = writeln!(
-            f,
-            "tick={tick} units={total} guide={with_guide} settled={settled} moved={moved} max_disp={max_disp:.4}"
-        );
-    }
+// ============================================================================ Continuous ECS adapter
+
+/// Snapshot ECS data, call the shared fixed-step core, then write it back once.
+/// The explicit mode guard also protects callers outside the game schedule.
+pub fn update_sim_crowd(mut env: ResMut<SimEnv>, mut q: Query<(Entity, &mut Unit)>) {
+    if !env.use_crowd { return; }
+    let mut order: Vec<_> = q.iter().map(|(e, u)| (u.idx, e)).collect();
+    order.sort_by_key(|&(id, _)| id);
+    let mut units: Vec<_> = order.iter().map(|&(_, e)| q.get(e).unwrap().1.clone()).collect();
+    crate::simulation::step_continuous(&mut env, &mut units);
+    for ((_, e), unit) in order.into_iter().zip(units) { *q.get_mut(e).unwrap().1 = unit; }
 }
-
-pub fn update_sim_crowd(
-    time: Res<Time<Fixed>>,
-    mut env: ResMut<SimEnv>,
-    mut q: Query<(Entity, &mut Unit)>,
-) {
-    let dt = time.delta_secs();
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("nav_debug.log") {
-            let units = q.iter().count();
-            let _ = writeln!(f, "ENTER dt={dt:.5} units={units}");
-        }
-    }
-    if dt <= 0.0 {
-        return;
-    }
-    let mut order: Vec<(i32, Entity)> = q.iter_mut().map(|(e, u)| (u.idx, e)).collect();
-    order.sort_by_key(|&(i, _)| i);
-
-    let env = &mut *env;
-    if env.nav.cost.is_empty() {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("nav_debug.log") {
-            let _ = writeln!(
-                f,
-                "EARLY nav_empty w={} h={} ground_valid={}",
-                env.nav.w,
-                env.nav.h,
-                env.ground.valid()
-            );
-        }
-        return;
-    }
-
-    // ---- 1. 快照：位置 / 路权 / 半径 ----------------------------------------
-    let mut agents: Vec<crowd::Agent> = Vec::with_capacity(order.len());
-    for &(_, e) in &order {
-        let u = q.get_mut(e).unwrap().1;
-        // 路权：离自己那一格越近越优先（用场的剩余距离；没有场就用欧氏距离）
-        let remaining = match (&u.guide, u.cell_x >= 0.0) {
-            (Some(gf), true) => {
-                let cx = u.cell_x.round() as i32;
-                let cy = u.cell_y.round() as i32;
-                if gf.in_(cx, cy) {
-                    gf.dist_at(cx, cy)
-                } else {
-                    0.0
-                }
-            }
-            _ => 0.0,
-        };
-        let settled = u.goal.x < 0
-            || (u.goal.x >= 0
-                && (u.cell_x - u.goal.x as f32).abs() < env.crowd_params.arrive_radius
-                && (u.cell_y - u.goal.y as f32).abs() < env.crowd_params.arrive_radius);
-        agents.push(crowd::Agent {
-            x: u.cell_x,
-            y: u.cell_y,
-            speed: u.speed,
-            priority: -remaining,
-            radius: 0.45,
-            settled: settled || !u.on_ground,
-            vx: u.vx,
-            vy: u.vy,
-            max_accel: u.speed * 6.0,
-        });
-    }
-
-    // ---- 2. 压力场：每 4 tick 重建一次（低频，避免抖动）--------------------
-    env.since_pressure += 1;
-    if env.since_pressure >= 4 || env.pressure.field.is_empty() {
-        env.pressure.rebuild(&env.nav, &agents);
-        env.since_pressure = 0;
-    }
-
-    // ---- 3. 速度层：算出每辆车的期望速度，把位置先推到快照里 ----------------
-    let snapshot = agents.clone();
-    let dt_safe = dt.max(1e-4);
-    let mut moved = vec![(0.0f32, 0.0f32); order.len()];
-    for (i, &(_, e)) in order.iter().enumerate() {
-        let u = q.get_mut(e).unwrap().1;
-        if !u.on_ground || u.goal.x < 0 || agents[i].settled {
-            continue;
-        }
-        let goal = (u.goal.x as f32, u.goal.y as f32);
-        let mut dir = long_range_dir(&u, &snapshot[i], goal);
-        // 卡死 → 切向逃逸：横着走一小会儿，绕开对头的那辆（GPU-Crowd-Godot 的做法）
-        if u.escape_ticks > 0 {
-            dir = crowd::rotate90(dir, u.escape_side);
-        }
-        let (vx, vy) = crowd::step_agent(
-            i,
-            &snapshot,
-            dir,
-            goal,
-            &env.pressure,
-            &env.crowd_params,
-            dt,
-        );
-        let from = (agents[i].x, agents[i].y);
-        let (nx, ny) = crowd::resolve_position(&env.nav, from, (from.0 + vx * dt, from.1 + vy * dt));
-        agents[i].x = nx;
-        agents[i].y = ny;
-        moved[i] = (nx - from.0, ny - from.1);
-    }
-
-    // ---- 4. 位置修正层：把重叠的圆盘直接推开 --------------------------------
-    // 速度层只能把稳态压到「软重叠」——期望速度一直在往里顶。这一层是硬约束。
-    let min_dist = env.crowd_params.radius_default() * 2.0;
-    crowd::resolve_overlaps(&mut agents, &env.nav, min_dist, 2);
-
-    // ---- 5. 写回 ECS：位置、速度、朝向、贴地 --------------------------------
-    let mut dbg_moved = 0usize;
-    let mut dbg_guide = 0usize;
-    let mut dbg_settled = 0usize;
-    let mut dbg_max_disp = 0.0f32;
-    for (i, &(_, e)) in order.iter().enumerate() {
-        let mut u = q.get_mut(e).unwrap().1;
-        let dx = agents[i].x - u.cell_x;
-        let dy = agents[i].y - u.cell_y;
-        if u.guide.is_some() {
-            dbg_guide += 1;
-        }
-        if agents[i].settled {
-            dbg_settled += 1;
-        }
-        let disp_dbg = (dx * dx + dy * dy).sqrt();
-        if disp_dbg > 1e-4 {
-            dbg_moved += 1;
-            dbg_max_disp = dbg_max_disp.max(disp_dbg);
-        }
-        u.cell_x = agents[i].x;
-        u.cell_y = agents[i].y;
-        u.vx = dx / dt_safe;
-        u.vy = dy / dt_safe;
-        u.path.clear();
-        u.leg_t = 0.0;
-
-        // 卡死判据：想走（不 settled）却几乎没动
-        let want_move = !agents[i].settled;
-        let disp = (dx * dx + dy * dy).sqrt();
-        if disp > 1e-4 {
-            u.still_ticks = 0;
-        } else {
-            u.still_ticks = u.still_ticks.saturating_add(1);
-        }
-        if want_move && disp < 0.02 * dt_safe {
-            u.stall_ticks += 1;
-        } else {
-            u.stall_ticks = 0;
-        }
-        if u.escape_ticks > 0 {
-            u.escape_ticks -= 1;
-        }
-        if u.stall_ticks > 30 && u.escape_ticks == 0 {
-            u.escape_ticks = 20;
-            u.escape_side = if (u.idx % 2) == 0 { 1.0 } else { -1.0 };
-            u.stall_ticks = 0;
-        }
-
-        // 车体朝向跟着速度走；没速度就保持原朝向，别抽搐
-        let sp = (u.vx * u.vx + u.vy * u.vy).sqrt();
-        if sp > 0.15 {
-            u.dir_target = nav::facing_angle_of(u.vx, u.vy);
-        }
-        u.dir_angle = turn_toward(u.dir_angle, u.dir_target, u.turn_rate * dt);
-
-        // 到位了就**撤销指令**：变回无指令的单位。
-        // 否则 goal 会一直挂着，炮塔也一直锁在最后那个点上，看着像还在执行命令。
-        u.turret_idle = u.still_ticks > 20;
-
-        aim_turret(&mut u, dt);
-
-        // 贴地
-        if env.ground.valid() {
-            let rx = u.cell_x.round() as i32;
-            let ry = u.cell_y.round() as i32;
-            let z = env.ground.level_at(rx, ry);
-            let ramp = env.ground.ramp_at(rx, ry);
-            if u.ground_dirty || z != u.cell_z || ramp != u.ramp_type {
-                u.ground_dirty = false;
-                u.cell_z = z;
-                u.ramp_type = ramp;
-                let (p, y) = env.ground.tilt_at(rx, ry);
-                u.tilt_pitch = p;
-                u.tilt_yaw = y;
-            }
-        }
-    }
-
-    env.tick += 1;
-}
-
-
 
 /// 炮塔瞄准（两套运动系统共用）。
 ///
 /// 有指令时：**瞄接下来要去的地方**（流场前瞻），不是瞄最初那个格子 —— 否则走过头就朝后看。
 /// 离目标 1.5 格内改瞄目标格，收尾要稳。
 /// 无指令时：以 turret_rate 的 20% 慢慢摆回车头方向，别硬僵在最后那个点上。
-fn aim_turret(u: &mut Unit, dt: f32) {
+pub(crate) fn aim_turret(u: &mut Unit, dt: f32) {
     // 「闲」只由 turret_idle 决定，绝不看 goal
     if u.goal.x < 0 || u.turret_idle {
         u.turret_angle = turn_toward(u.turret_angle, u.dir_angle, u.turret_rate * 0.2 * dt);
@@ -1265,52 +1064,6 @@ fn flow_lookahead(u: &Unit, steps: i32) -> Option<(f32, f32)> {
     } else {
         None
     }
-}
-
-/// 长程方向：场里 8 邻域的最省格；没有场就直指目标。
-fn long_range_dir(u: &Unit, me: &crowd::Agent, goal: (f32, f32)) -> (f32, f32) {
-    let fallback = {
-        let dx = goal.0 - me.x;
-        let dy = goal.1 - me.y;
-        let len = (dx * dx + dy * dy).sqrt();
-        if len <= 1e-6 {
-            (0.0, 0.0)
-        } else {
-            (dx / len, dy / len)
-        }
-    };
-    let Some(gf) = u.guide.as_ref() else {
-        return fallback;
-    };
-    let cx = me.x.round() as i32;
-    let cy = me.y.round() as i32;
-    if !gf.in_(cx, cy) {
-        return fallback;
-    }
-    let here = gf.dist_at(cx, cy);
-    let mut best = here;
-    let mut bx = 0i32;
-    let mut by = 0i32;
-    for d in 0..8 {
-        let ax = cx + K_NEIGH_X[d];
-        let ay = cy + K_NEIGH_Y[d];
-        if !gf.in_(ax, ay) {
-            continue;
-        }
-        let s = gf.dist_at(ax, ay);
-        if s < best {
-            best = s;
-            bx = K_NEIGH_X[d];
-            by = K_NEIGH_Y[d];
-        }
-    }
-    if bx == 0 && by == 0 {
-        // 已经在场上最省的地方（碗底）：朝目标那个格收
-        return fallback;
-    }
-    let (dx, dy) = (bx as f32, by as f32);
-    let len = (dx * dx + dy * dy).sqrt();
-    (dx / len, dy / len)
 }
 
 // ============================================================================ 单测

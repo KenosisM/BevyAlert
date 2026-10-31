@@ -820,13 +820,15 @@ pub fn run(args: Vec<String>) {
         clear = [0.0, 0.0, 0.0];
     }
     app.insert_resource(ClearColor(Color::srgb(clear[0], clear[1], clear[2])));
-    app.insert_resource(Time::<Fixed>::from_hz(cfg.tick_hz as f64));
+    let runtime = crate::simulation::Runtime::from_hz(cfg.tick_hz as f64, 0);
+    app.insert_resource(Time::<Fixed>::from_duration(runtime.fixed_step()));
     app.insert_resource(SimEnv {
         ground: gf,
         nav: nav_grid,
         footprint,
         occupied: Vec::new(),
         tick: 0,
+        runtime,
         // 连续运动层（路线 C）。想退回旧的离散重力碗做对照，把这里改成 false。
         // ⚠️ 暂时回到旧的离散重力碗：新的连续运动层还没在真实地图上验过，
         // 已知问题：脚本指令下单位可能不动。改 true 就切回新系统。
