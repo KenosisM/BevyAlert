@@ -21,6 +21,8 @@ use crate::nav::CostGrid;
 /// 一个 agent 的快照（每 tick 建一次，供邻居查询用）。
 #[derive(Clone, Copy, Debug)]
 pub struct Agent {
+    /// Shared formation command, only for units with exclusive parking targets.
+    pub group: Option<u64>,
     pub x: f32,
     pub y: f32,
     pub speed: f32,
@@ -40,6 +42,7 @@ pub struct Agent {
 impl Default for Agent {
     fn default() -> Self {
         Agent {
+            group: None,
             x: 0.0,
             y: 0.0,
             speed: 6.0,
@@ -266,6 +269,11 @@ pub fn step_agent(
         // (2) 路权：谁该让。priority 越大越优先。
         //     我让：主动横向偏转（垂直于相对速度，方向选「远离对方」的那侧）
         //     他让：我只做很小的一点偏转，别为了躲他跑偏
+        // Exclusive teammates use their local parking paths around stationary
+        // owners. Artificial side yield against a parked row (or parallel traffic)
+        // would push followers out of their still-free arrival columns.
+        if me.group.is_some()&&me.group==other.group
+            &&(other.settled||me.vx*other.vx+me.vy*other.vy>0.0) {continue;}
         let approach = vx * (-ux) + vy * (-uy); // >0 表示我在朝他走
         if approach > 0.0 {
             let right_of_way = me.priority >= other.priority;
@@ -366,6 +374,22 @@ pub fn resolve_position(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_formation_members_do_not_receive_crossing_side_yield() {
+        let agents=vec![Agent{group:Some(1),x:4.0,y:4.0,vx:6.0,..Agent::default()},
+            Agent{group:Some(1),x:5.1,y:4.0,vx:6.0,..Agent::default()}];
+        let velocity=step_agent(0,&agents,&[0,1],(1.0,0.0),(25.0,4.0),&Pressure::default(),&Params::default(),1.0/60.0);
+        assert!(velocity.0>0.0);assert!(velocity.1.abs()<1e-6);
+    }
+
+    #[test]
+    fn a_parked_teammate_beyond_the_exclusive_goal_does_not_deflect_its_follower() {
+        let agents=vec![Agent{group:Some(1),x:4.0,y:4.0,vx:4.0,..Agent::default()},
+            Agent{group:Some(1),x:5.65,y:4.0,settled:true,..Agent::default()}];
+        let velocity=step_agent(0,&agents,&[0,1],(1.0,0.0),(4.55,4.0),&Pressure::default(),&Params::default(),1.0/60.0);
+        assert!(velocity.0>0.0);assert!(velocity.1.abs()<1e-6);
+    }
 
     fn flat_grid(w: i32, h: i32) -> CostGrid {
         let mut g = CostGrid::default();

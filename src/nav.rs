@@ -263,6 +263,12 @@ pub fn find_path_extra(
     extra_blocked: &dyn Fn(i32, i32) -> bool,
     budget: i32,
 ) -> PathResult {
+    find_path_filtered(g,from,to,extra_blocked,budget,&mut |_,_|true)
+}
+
+/// Additional physical edge constraints supplement, never bypass, the shared nav edge.
+pub fn find_path_filtered(g:&CostGrid,from:Cell,to:Cell,extra_blocked:&dyn Fn(i32,i32)->bool,
+    budget:i32,edge_allowed:&mut dyn FnMut(Cell,Cell)->bool)->PathResult {
     // 上游 `PathResult::expanded` 从头到尾没被赋值（恒 0），这里照抄不写。
     let mut out = PathResult {
         cells: Vec::new(),
@@ -325,6 +331,7 @@ pub fn find_path_extra(
             let nx = cx + K_DIR_X[d];
             let ny = cy + K_DIR_Y[d];
             let Some(step)=step_cost_extra(g,Cell::new(cx,cy),Cell::new(nx,ny),extra_blocked) else {continue;};
+            if !edge_allowed(Cell::new(cx,cy),Cell::new(nx,ny)) {continue;}
             let ni = idx(nx, ny) as i32;
             if closed[ni as usize] != 0 {
                 continue;

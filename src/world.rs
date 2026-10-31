@@ -370,6 +370,8 @@ pub struct Unit {
     pub idx: i32,
     /// Shared command identity; None before the first order.
     pub command_id: Option<crate::simulation::CommandId>,
+    pub parking: Option<crate::formation::Target>,
+    pub contact_hold: bool,
 
     pub on_ground: bool,
     /// 位置（格单位）。上游 onGround 实体用 (cellX,cellY)、非地面用 (x,y)；这里统一成格坐标。
@@ -431,6 +433,8 @@ impl Default for Unit {
         Unit {
             idx: 0,
             command_id: None,
+            parking: None,
+            contact_hold: false,
             on_ground: true,
             cell_x: 0.0,
             cell_y: 0.0,
@@ -477,6 +481,7 @@ pub struct SimEnv {
     pub tick: u64,
     pub runtime: crate::simulation::Runtime,
     pub buffers: crate::simulation::Buffers,
+    pub reservations: crate::formation::Reservations,
 
     // ---- 连续运动层（路线 C）------------------------------------------------
     /// true = 走 `update_sim_crowd`（互斥力 + 路权 + 压力场），false = 走旧的离散重力碗
@@ -498,6 +503,7 @@ impl Default for SimEnv {
             tick: 0,
             runtime: crate::simulation::Runtime::default(),
             buffers: crate::simulation::Buffers::default(),
+            reservations: crate::formation::Reservations::default(),
             use_crowd: true,
             pressure: crowd::Pressure::default(),
             crowd_params: crowd::Params::default(),

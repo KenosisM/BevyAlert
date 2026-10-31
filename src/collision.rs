@@ -7,9 +7,15 @@ use crate::spatial::{Aabb,Index};
 pub struct Workspace {
     pub projection_index:Index,pub trajectory_index:Index,
     bounds:Vec<Aabb>,pairs:Vec<(usize,usize)>,neighbors:Vec<usize>,before_projection:Vec<Vec2>,
+    recovery:Vec<bool>,
 }
 impl Workspace {
     pub fn begin_tick(&mut self) {self.projection_index.begin_tick();self.trajectory_index.begin_tick();}
+}
+
+fn trajectory_pairs(old:&[Agent],next:&[Agent],w:&mut Workspace) {
+    w.bounds.clear();w.bounds.extend(old.iter().zip(next.iter()).map(|(a,b)|Aabb::swept(pos(a),pos(b),a.radius+CONTACT_GAP)));
+    w.trajectory_index.rebuild(&w.bounds);w.trajectory_index.pairs(&mut w.pairs);
 }
 
 /// Contact gap used to avoid repeated floating-point hits; radii are never reduced.
@@ -118,6 +124,18 @@ fn clip(g:&CostGrid,from:Vec2,to:Vec2,r:f32)->Vec2 {
     from+d*(lo-CONTACT_GAP/d.length().max(CONTACT_GAP)).max(0.0)
 }
 
+pub fn disc_segment_clear(g:&CostGrid,from:Vec2,to:Vec2,r:f32)->bool {
+    disc_clear(g,from,r)&&disc_clear(g,to,r)
+        &&nav::segment_allowed(g,(from.x,from.y),(to.x,to.y))
+        &&first_hit(g,from,to-from,r).is_none_or(|h|h.t>=1.0-EPS)
+}
+
+pub fn segment_avoids_disc(from:Vec2,to:Vec2,center:Vec2,radius:f32)->bool {
+    let q=from.as_dvec2()-center.as_dvec2();let d=to.as_dvec2()-from.as_dvec2();
+    let t=(-q.dot(d)/d.length_squared().max(1e-20)).clamp(0.0,1.0);
+    (q+d*t).length()>=radius as f64-EPS as f64
+}
+
 /// Slide on the first wall, then verify the resulting *whole* tick segment again.
 /// An invalid initial position is reported and kept; this routine never searches for a teleport target.
 pub fn move_disc(g:&CostGrid,from:Vec2,to:Vec2,r:f32)->(Vec2,Blocked) {
@@ -137,10 +155,10 @@ pub fn move_disc(g:&CostGrid,from:Vec2,to:Vec2,r:f32)->(Vec2,Blocked) {
 /// A wall-blocked share is offered to the other body, then all pairs are revisited.
 #[cfg(test)]
 pub fn project_contacts(agents:&mut [Agent],g:&CostGrid,iterations:u32) {
-    project_contacts_with_workspace(agents,g,iterations,&mut Workspace::default());
+    project_contacts_with_workspace(agents,g,iterations,None,&mut Workspace::default());
 }
 
-fn project_contacts_with_workspace(agents:&mut [Agent],g:&CostGrid,iterations:u32,w:&mut Workspace) {
+fn project_contacts_with_workspace(agents:&mut [Agent],g:&CostGrid,iterations:u32,initial:Option<&[Agent]>,w:&mut Workspace) {
     let max_radius=agents.iter().map(|a|a.radius).fold(0.0f32,f32::max);
     w.bounds.clear();w.bounds.extend(agents.iter().map(|a|Aabb::point(pos(a))));w.projection_index.rebuild(&w.bounds);
     for _ in 0..iterations {
@@ -150,6 +168,10 @@ fn project_contacts_with_workspace(agents:&mut [Agent],g:&CostGrid,iterations:u3
             let mut cursor=0;let mut after=i;
             while cursor<w.neighbors.len() {
             let j=w.neighbors[cursor];cursor+=1;if j<=after {continue;}after=j;
+            if let Some(old)=initial {
+                if pos(&old[i]).distance(pos(&old[j]))+EPS>=old[i].radius+old[j].radius {continue;}
+                w.recovery[i]=true;w.recovery[j]=true;
+            }
             let (pi,pj)=(pos(&agents[i]),pos(&agents[j]));let q=pj-pi;let dist=q.length();
             let overlap=agents[i].radius+agents[j].radius+CONTACT_GAP-dist;
             if overlap<=EPS {continue;}
@@ -205,25 +227,42 @@ pub fn finish_motion_with_workspace(old:&[Agent],next:&mut [Agent],g:&CostGrid,w
         set(&mut next[i],p);report.reasons[i]=reason;
     }
     w.before_projection.clear();w.before_projection.extend(next.iter().map(pos));
-    project_contacts_with_workspace(next,g,8,w);
+    w.recovery.clear();w.recovery.resize(next.len(),false);
+    project_contacts_with_workspace(next,g,8,Some(old),w);
     for i in 0..next.len() {
         if pos(&next[i]).distance_squared(w.before_projection[i])>EPS*EPS && report.reasons[i]==Blocked::None {
             report.reasons[i]=Blocked::Contact;
         }
         if disc_clear(g,pos(&old[i]),old[i].radius) {let p=clip(g,pos(&old[i]),pos(&next[i]),old[i].radius);set(&mut next[i],p);}
     }
-    // Subsequent trajectory limits only shrink these boxes, so this pair superset
-    // remains conservative for every CCD iteration and the final error measurement.
-    w.bounds.clear();w.bounds.extend(old.iter().zip(next.iter()).map(|(a,b)|Aabb::swept(pos(a),pos(b),a.radius+CONTACT_GAP)));
-    w.trajectory_index.rebuild(&w.bounds);w.trajectory_index.pairs(&mut w.pairs);
     let mut safe=false;
     for _ in 0..32 {
+        // Tangential projection can change a trajectory's box. Rebuild before each
+        // pass instead of assuming candidates from the original motion still cover it.
+        trajectory_pairs(old,next,w);
         let mut limited=false;
         for &(i,j) in &w.pairs {
             if let Some(t)=pair_toi(old,next,i,j) {
                 let di=pos(&next[i])-pos(&old[i]);let dj=pos(&next[j])-pos(&old[j]);
-                let scale=(t-CONTACT_GAP/(di-dj).length().max(CONTACT_GAP)).max(0.0);
-                set(&mut next[i],pos(&old[i])+di*scale);set(&mut next[j],pos(&old[j])+dj*scale);
+                let n=((pos(&old[j])-pos(&old[i]))+(dj-di)*t).normalize_or_zero();
+                let q=pos(&old[j])-pos(&old[i]);
+                // Do not demand a new gap where valid bodies already touch: that
+                // can be infeasible against a wall and needlessly kill tangent motion.
+                let target=q.dot(n).min(old[i].radius+old[j].radius+CONTACT_GAP);
+                let correction=((q+dj-di).dot(n)-target).min(0.0);
+                let fixed_i=old[i].settled||(!w.recovery[i]&&w.before_projection[i].distance_squared(pos(&old[i]))<1e-16);
+                let fixed_j=old[j].settled||(!w.recovery[j]&&w.before_projection[j].distance_squared(pos(&old[j]))<1e-16);
+                let (wi,wj)=match (fixed_i,fixed_j) {
+                    (true,false)=>(0.0,1.0),(false,true)=>(1.0,0.0),_=>(0.5,0.5),
+                };
+                let bound=|k:usize,candidate:Vec2| {
+                    let delta=candidate-pos(&old[k]);let cap=w.before_projection[k].distance(pos(&old[k]));
+                    let candidate=if !w.recovery[k]&&delta.length()>cap {pos(&old[k])+delta.normalize_or_zero()*cap}else{candidate};
+                    clip(g,pos(&old[k]),candidate,old[k].radius)
+                };
+                let pi=bound(i,pos(&old[i])+di+n*(correction*wi));
+                let pj=bound(j,pos(&old[j])+dj-n*(correction*wj));
+                set(&mut next[i],pi);set(&mut next[j],pj);
                 report.reasons[i]=Blocked::Contact;report.reasons[j]=Blocked::Contact;
                 report.limited_trajectories+=1;limited=true;
             }
@@ -231,7 +270,19 @@ pub fn finish_motion_with_workspace(old:&[Agent],next:&mut [Agent],g:&CostGrid,w
         if !limited {safe=true;break;}
     }
     if !safe {
-        for i in 0..next.len() {set(&mut next[i],pos(&old[i]));report.reasons[i]=Blocked::SafetyStop;}
+        // Holding an unresolved pair can affect its followers. Propagate only those
+        // necessary holds; a distant, legal trajectory must not be globally stopped.
+        trajectory_pairs(old,next,w);
+        for _ in 0..next.len() {
+            let mut changed=false;
+            for &(i,j) in &w.pairs {
+                if pair_toi(old,next,i,j).is_none() {continue;}
+                for k in [i,j] {if pos(&next[k])!=pos(&old[k]) {
+                    set(&mut next[k],pos(&old[k]));report.reasons[k]=Blocked::SafetyStop;changed=true;
+                }}
+            }
+            if !changed {break;}
+        }
     }
     for &(i,j) in &w.pairs {
         let q=pos(&old[j])-pos(&old[i]);let r=old[i].radius+old[j].radius;
@@ -326,6 +377,25 @@ mod tests {
         }
     }
     #[test]
+    fn touching_discs_keep_legal_opposite_tangential_motion() {
+        let g=grid(20,20);let old=vec![agent(5.0,5.0),agent(5.9,5.0)];let mut next=old.clone();
+        next[0].x+=0.1;next[0].y+=0.1;next[1].x-=0.1;next[1].y-=0.1;
+        let report=finish_motion(&old,&mut next,&g);
+        assert_eq!(report.unresolved_pairs,0);assert_eq!(report.illegal_static_trajectories,0);
+        assert!(swept_distance(&old[0],&old[1],&next[0],&next[1])>=0.89998);
+        assert!(next[0].y>5.05&&next[1].y<4.95,"safe tangent motion was unnecessarily stopped");
+        for i in 0..2 {assert!(pos(&next[i]).distance(pos(&old[i]))<=0.02f32.sqrt()+EPS);}
+    }
+    #[test]
+    fn a_touching_body_can_slide_between_a_fixed_body_and_the_map_edge() {
+        let g=grid(8,8);let old=vec![agent(-0.05,4.0),Agent{settled:true,..agent(0.85,4.0)}];
+        let mut next=old.clone();next[0].x+=0.1;next[0].y+=0.1;
+        let report=finish_motion(&old,&mut next,&g);
+        assert!(next[0].y>4.09);assert_eq!(pos(&next[1]),pos(&old[1]));
+        assert_eq!(report.illegal_static_trajectories,0);assert_eq!(report.unresolved_pairs,0);
+        assert!(swept_distance(&old[0],&old[1],&next[0],&next[1])>=0.89998);
+    }
+    #[test]
     fn seeded_proposals_check_followers_after_contact_limiting() {
         let g=grid(32,32);let mut rng=7u64;
         for _ in 0..128 {
@@ -335,11 +405,26 @@ mod tests {
                 rng=rng.wrapping_mul(6364136223846793005).wrapping_add(1);a.x+=((rng>>32) as u32 as f64/u32::MAX as f64*8.0-4.0) as f32;
                 rng=rng.wrapping_mul(6364136223846793005).wrapping_add(1);a.y+=((rng>>32) as u32 as f64/u32::MAX as f64*8.0-4.0) as f32;
             }
-            let report=finish_motion(&old,&mut next,&g);assert_eq!(report.unresolved_pairs,0);
+            let intended=next.clone();let report=finish_motion(&old,&mut next,&g);assert_eq!(report.unresolved_pairs,0);
+            for i in 0..old.len() {assert!(pos(&next[i]).distance(pos(&old[i]))<=pos(&intended[i]).distance(pos(&old[i]))+EPS);}
             assert!(report.max_swept_penetration<=0.00002);assert_eq!(report.illegal_static_trajectories,0);
             for i in 0..old.len() {for j in i+1..old.len() {
                 assert!(swept_distance(&old[i],&old[j],&next[i],&next[j])>=0.89998);
             }}
+        }
+    }
+    #[test]
+    fn dense_contact_fallback_does_not_stop_a_disjoint_trajectory() {
+        let g=grid(40,40);let mut rng=19u64;
+        for _ in 0..32 {
+            let mut old:Vec<_>=(0..16).map(|i|agent(10.0+(i%4) as f32*0.901,10.0+(i/4) as f32*0.901)).collect();
+            old.push(agent(30.0,30.0));let mut next=old.clone();
+            for a in &mut next[..16] {
+                rng=rng.wrapping_mul(6364136223846793005).wrapping_add(1);a.x+=((rng>>32) as u32 as f64/u32::MAX as f64*0.2-0.1) as f32;
+                rng=rng.wrapping_mul(6364136223846793005).wrapping_add(1);a.y+=((rng>>32) as u32 as f64/u32::MAX as f64*0.2-0.1) as f32;
+            }
+            next[16].x+=0.1;let expected=pos(&next[16]);let report=finish_motion(&old,&mut next,&g);
+            assert_eq!(pos(&next[16]),expected);assert!(report.max_swept_penetration<=0.00002);assert_eq!(report.unresolved_pairs,0);
         }
     }
     #[test]

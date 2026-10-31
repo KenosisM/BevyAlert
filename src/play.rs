@@ -6,14 +6,12 @@
 //! 上游 `play.cpp` 还含窗口 / DIB / blit / 相机 / PNG 输出 —— 那些属渲染与平台层，
 //! 由 Bevy 侧承担，**不搬**。
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 
 use bevy::prelude::*;
 
-use crate::nav::{
-    compute_flow_field_cpu_multi, path_to_nearest_source, well_floor_cells, Cell, CostGrid,
-    FlowField,
-};
+use crate::nav::{Cell,CostGrid};
+use crate::formation::{self,Body,Outcome,OrderReport};
 use crate::world::{SimEnv, Unit};
 
 /// 当前选中的单位。上游是 `Play::sel`（entities 的下标列表）。
@@ -33,89 +31,90 @@ pub fn nearest_usable(g:&CostGrid,want:Cell)->Option<Cell> {
     }}best
 }
 
-/// RA2 的移动指令：点一处，整群朝它掉下去。这一群是被丢进碗里的一把球 —— 点击处是碗底的中心，
-/// 每辆车顺墙滚下来、横穿平地，直到平地满了。没有「到达」，也没有每车一条路线：只有那**一张**场。
-///
-/// 返回真正拿到路线的单位数（上游 `pathed`）。用 exclusive 形式（`&mut World`）是因为它要
-/// 按选中表逐车写 `guide/goal/...`，而车位又是 ECS 实体。
-pub fn issue_order_at(world: &mut World, dest: Cell) -> usize {
-    // 取一份导航网格（侵蚀过、单位真正看到的那张）与足迹。指令不频繁，克隆一次无所谓。
-    let (nav, footprint) = {
-        let env = world.resource::<SimEnv>();
-        (env.nav.clone(), env.footprint)
+/// Compatibility count; callers needing the reason use issue_order or issue_orders_at.
+pub fn issue_order_at(world:&mut World,dest:Cell)->usize {issue_order(world,dest).accepted}
+
+pub fn issue_order(world:&mut World,dest:Cell)->OrderReport {
+    let selected=world.resource::<Selection>().0.clone();
+    let report=issue_orders_at(world,&[(selected,dest)]).remove(0);
+    world.resource_mut::<SimEnv>().reservations.last_order=Some(report.clone());report
+}
+
+/// Simultaneous orders reserve atomically. Departing occupants are classified
+/// before any new region is allocated, so swaps do not depend on request order.
+pub fn issue_orders_at(world:&mut World,requests:&[(Vec<Entity>,Cell)])->Vec<OrderReport> {
+    let start=std::time::Instant::now();let reports=issue_orders_inner(world,requests);
+    let mut env=world.resource_mut::<SimEnv>();env.reservations.planning_time=start.elapsed();
+    env.reservations.last_order=reports.last().cloned();reports
+}
+
+fn issue_orders_inner(world:&mut World,requests:&[(Vec<Entity>,Cell)])->Vec<OrderReport> {
+    let (nav,footprint,radius)= {
+        let env=world.resource::<SimEnv>();(env.nav.clone(),env.footprint,env.crowd_params.radius_default())
     };
-    if !nav.valid() || footprint.w<=0 || footprint.h<=0 {return 0;}
-    let mut sel:Vec<_>=world.resource::<Selection>().0.iter().copied().filter(|e| {
-        world.get::<Unit>(*e).is_some_and(|u|u.on_ground&&u.cell_x.is_finite()&&u.cell_y.is_finite()
-            &&nav.walkable(u.cell_x.round() as i32,u.cell_y.round() as i32))
-    }).collect();
-    sel.sort_by_key(|e|world.get::<Unit>(*e).unwrap().idx);sel.dedup();
-    if sel.is_empty(){return 0;}
-
-    let Some(dest)=nearest_usable(&nav,dest) else {return 0;};
-
-    // 碗底的大小**取自这一群**：它恰好装下与车数相同的格，于是「填满」与「停下」是同一件事 ——
-    // 最后一辆进来后没有空格剩下，整群就停下，没有任何人为的刹车。宽一格就永远静不下来。
-    //
-    // 场是从**整块碗底**播种的，不是只从点击那一格。每辆车读同一份箭头，于是它的路线是一张
-    // 标量场的流线，两条不可能相交。每车一张私场正是当年产生交叉的原因。
-    let n = sel.len() as i32;
-    let mut sum_x = 0.0f64;
-    let mut sum_y = 0.0f64;
-    for &e in &sel {
-        let u = world.get::<Unit>(e).unwrap();
-        sum_x += u.cell_x as f64;
-        sum_y += u.cell_y as f64;
-    }
-    let head_x = (dest.x as f64 - sum_x / sel.len() as f64) as f32;
-    let head_y = (dest.y as f64 - sum_y / sel.len() as f64) as f32;
-    let mut floor = well_floor_cells(&nav, &footprint, dest, n, head_x, head_y);
-    if floor.is_empty() {
-        floor.push(dest);
-    }
-    // 行动预算：一辆车愿意忍受被**挡住**多久（tick）。站着不动两秒足够它前面任何一条队清空。
-    // 自由滚动不花钱，所以这与编队大小、碗底大小都无关。
-    let ap_budget = (2.0f64 * 1200.0).ceil() as i32;
-
-    let mut shared = FlowField::default();
-    if !compute_flow_field_cpu_multi(&nav, &floor, &mut shared) {
-        return 0;
-    }
-    let shared = Arc::new(shared);
-    let mut command_id=None;
-    let mut pathed = 0usize;
-    for (i, &e) in sel.iter().enumerate() {
-        let here = {
-            let u = world.get::<Unit>(e).unwrap();
-            Cell::new(u.cell_x.round() as i32, u.cell_y.round() as i32)
-        };
-        if !shared.in_(here.x, here.y) {
-            continue;
+    let reject=|index:usize,outcome:Outcome,available:usize|requests.iter().enumerate().map(|(i,(units,_))|
+        OrderReport::failed(if i==index {outcome}else{Outcome::BatchAborted},units.len(),available)).collect::<Vec<_>>();
+    if requests.is_empty() {return Vec::new();}
+    if !nav.valid()||footprint.w<=0||footprint.h<=0 {return reject(0,Outcome::InvalidTarget,0);}
+    let mut snapshots:Vec<_>=world.query::<&Unit>().iter(world).cloned().collect();snapshots.sort_by_key(|u|u.idx);
+    let all:Vec<_>=snapshots.iter().filter(|u|u.on_ground).map(|u|formation::body(u,radius)).collect();
+    let labels=formation::components(&nav);let mut normalized=Vec::new();let mut departing=BTreeSet::new();
+    for (index,(selected,want)) in requests.iter().enumerate() {
+        let Some(dest)=nearest_usable(&nav,*want) else{return reject(index,Outcome::InvalidTarget,0);};
+        let group=formation::component(&nav,&labels,dest);
+        let mut entities:Vec<_>=selected.iter().copied().filter(|e|world.get::<Unit>(*e).is_some_and(|u|
+            u.on_ground&&u.cell_x.is_finite()&&u.cell_y.is_finite()&&crate::collision::disc_clear(&nav,
+                bevy::math::Vec2::new(u.cell_x,u.cell_y),radius))).collect();
+        entities.sort_by_key(|e|world.get::<Unit>(*e).unwrap().idx);entities.dedup();
+        let mut reachable=Vec::new();let mut unreachable=0;
+        for e in entities {
+            let u=world.get::<Unit>(e).unwrap();let c=Cell::new(u.cell_x.round() as i32,u.cell_y.round() as i32);
+            if formation::component(&nav,&labels,c)!=group {unreachable+=1;continue;}
+            if !departing.insert(u.idx) {return reject(index,Outcome::BatchAborted,0);}
+            reachable.push(e);
         }
-        let mut reached = Cell::default();
-        let mut route: Vec<Cell> = Vec::new();
-        if !path_to_nearest_source(&nav,&shared,here,&mut reached,&mut route) {continue;}
-        let goal=reached;
-        let id=*command_id.get_or_insert_with(||world.resource_mut::<SimEnv>().runtime.allocate_command());
-
-        let mut u = world.get_mut::<Unit>(e).unwrap();
-        u.guide = Some(shared.clone());
-        // 它自己那一格碗底：顺着共享场最近的播种格。它只是标记指向哪儿，车的运动是跟场走的。
-        u.goal = goal;
-        u.command_id = Some(id);
-        u.start_delay = if sel.len() == 1 {
-            0.0
-        } else {
-            0.04 * ((i % 7) as f32)
-        };
-        u.ap_budget = ap_budget;
-        u.still_ticks = 0;
-        u.turret_idle = false;
-        if u.path.len() != 2 {
-            u.path.clear();
-            u.leg_t = 0.0;
-        }
-        pathed += 1;
+        if reachable.is_empty() {return reject(index,Outcome::NoReachableUnits,0);}
+        normalized.push((dest,reachable,unreachable));
     }
-    pathed
+    let mut staged=world.resource::<SimEnv>().reservations.clone();staged.prune(&snapshots);
+    for id in &departing {staged.release(*id);}
+    let mut plans=Vec::new();
+    for (index,(dest,entities,_)) in normalized.iter().enumerate() {
+        let bodies:Vec<Body>=entities.iter().map(|e|formation::body(world.get::<Unit>(*e).unwrap(),radius)).collect();
+        match formation::plan(&nav,&labels,*dest,&bodies,&all,&departing,&mut staged,None) {
+            Ok(plan)=>plans.push(plan),Err(f)=>return reject(index,f.outcome,f.available),
+        }
+    }
+    let mut reports=Vec::new();
+    for (index,((_,entities,unreachable),plan)) in normalized.into_iter().zip(plans).enumerate() {
+        let accepted=entities.len();
+        let command=world.resource_mut::<SimEnv>().runtime.allocate_command();
+        let ap_budget=(2.0/world.resource::<SimEnv>().runtime.dt()).ceil() as i32;
+        for ((id,target),e) in plan.targets.into_iter().zip(entities) {
+            let mut u=world.get_mut::<Unit>(e).unwrap();assert_eq!(u.idx,id);
+            u.goal=Cell::new(target.position.x.round() as i32,target.position.y.round() as i32);
+            u.parking=Some(target);u.command_id=Some(command);u.guide=Some(plan.guide.clone());
+            u.contact_hold=false;
+            u.start_delay=0.0;u.ap_budget=ap_budget;u.stall_ticks=0;u.still_ticks=0;u.escape_ticks=0;u.turret_idle=false;
+            if u.path.len()!=2 {u.path.clear();u.leg_t=0.0;}
+            staged.claims.get_mut(&id).unwrap().command=command.0;
+        }
+        let report=OrderReport{outcome:if unreachable>0||accepted<requests[index].0.len(){Outcome::Partial}else{Outcome::Assigned},
+            requested:requests[index].0.len(),accepted,unreachable,available:plan.available};
+        reports.push(report);
+    }
+    staged.last_order=reports.last().cloned();staged.rebuild_owners();world.resource_mut::<SimEnv>().reservations=staged;reports
+}
+
+/// Cancellation releases the selected owners' claims and retains their current positions.
+pub fn cancel_selected(world:&mut World)->usize {
+    let selected=world.resource::<Selection>().0.clone();let mut ids=BTreeSet::new();
+    for e in selected {
+        if let Some(mut u)=world.get_mut::<Unit>(e) {
+            ids.insert(u.idx);u.goal=Cell::new(-1,-1);u.command_id=None;u.parking=None;u.guide=None;
+            u.contact_hold=false;
+            u.path.clear();u.leg_t=0.0;u.vx=0.0;u.vy=0.0;u.stall_ticks=0;u.escape_ticks=0;
+        }
+    }
+    let mut env=world.resource_mut::<SimEnv>();for id in &ids {env.reservations.release(*id);}ids.len()
 }

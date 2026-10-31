@@ -7,6 +7,10 @@
 
 # 本地草稿、一次性脚本、调试导出
 /_scratch
+/.tools/
+/.cache/
+/.downloads/
+/.tmp/
 /其他
 *.png
 *.log

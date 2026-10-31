@@ -158,6 +158,7 @@ pub fn populate(world: &mut World, config: &SceneConfig) -> Result<(),String> {
     let mut fixed=Time::<Fixed>::from_duration(step); fixed.advance_by(step); world.insert_resource(fixed);
     let mut random=SeededInput(config.seed);
     let side=(config.per_group as f32).sqrt().ceil() as usize;
+    let mut requests=Vec::new();
     for (group,(start,dest)) in config.kind.routes().into_iter().enumerate() {
         let mut selected=Vec::with_capacity(config.per_group);
         for index in 0..config.per_group {
@@ -171,9 +172,10 @@ pub fn populate(world: &mut World, config: &SceneConfig) -> Result<(),String> {
             };
             selected.push(world.spawn(unit).id());
         }
-        world.resource_mut::<Selection>().0=selected;
-        if play::issue_order_at(world,dest)!=config.per_group { return Err("scenario command was not accepted for every unit".into()); }
+        requests.push((selected,dest));
     }
+    let reports=play::issue_orders_at(world,&requests);
+    if reports.iter().any(|r|r.accepted!=config.per_group) {return Err(format!("scenario command rejected: {reports:?}"));}
     for mut u in world.query::<&mut Unit>().iter_mut(world) { u.start_delay=0.0; }
     world.resource_mut::<Selection>().0.clear();
     Ok(())
@@ -194,6 +196,9 @@ pub struct Metrics {
     pub limited_trajectories:usize, pub initial_overlaps:usize, pub safety_stops:usize,
     pub collision_ready:bool,
     pub spatial:crate::spatial::Stats,
+    pub reserved:usize,pub frozen_targets:usize,pub waiting_space:usize,pub waiting_entrance:usize,pub blocked_near:usize,
+    pub planning_us:u128,pub formation_us:u128,
+    pub entry_refinements:u64,
 }
 
 pub fn metrics(world:&mut World) -> Metrics {
@@ -202,6 +207,8 @@ pub fn metrics(world:&mut World) -> Metrics {
     let mut m=Metrics { tick:env.tick,..default() };
     let contacts=&env.runtime.contacts;
     m.spatial=env.runtime.spatial_stats.clone();
+    m.reserved=env.reservations.claims.len();m.planning_us=env.reservations.planning_time.as_micros();
+    m.entry_refinements=env.reservations.entry_refinements;
     m.collision_ready=env.use_crowd&&env.tick>0;
     m.swept_penetration=contacts.max_swept_penetration;m.unresolved_contacts=contacts.unresolved_pairs;
     m.illegal_trajectories=contacts.illegal_static_trajectories;m.limited_trajectories=contacts.limited_trajectories;
@@ -210,6 +217,11 @@ pub fn metrics(world:&mut World) -> Metrics {
     let mut digest=0xcbf29ce484222325u64;
     for (i,u) in units.iter().enumerate() {
         m.active+=usize::from(u.goal.x>=0);
+        if let Some(t)=&u.parking {
+            m.frozen_targets+=usize::from(t.frozen);m.waiting_space+=usize::from(!t.valid);
+            m.waiting_entrance+=usize::from(t.blocked==Some(crate::formation::TargetBlock::Entrance));
+            m.blocked_near+=usize::from(t.blocked==Some(crate::formation::TargetBlock::NoLocalPath));
+        }
         m.moved+=usize::from(u.vx.hypot(u.vy)>0.02);
         m.legacy_stalled+=usize::from(u.stall_ticks>0);
         m.max_still_seconds=m.max_still_seconds.max(u.still_ticks as f32*env.runtime.dt());
@@ -228,6 +240,7 @@ pub fn metrics(world:&mut World) -> Metrics {
         let t=&sample.times;
         m.total_us=t.total.as_micros();m.snapshot_us=t.snapshot.as_micros();m.pressure_us=t.pressure.as_micros();
         m.velocity_us=t.velocity.as_micros();m.contact_us=t.contact.as_micros();m.writeback_us=t.writeback.as_micros();
+        m.formation_us=t.formation.as_micros();
     }
     m
 }
@@ -235,7 +248,7 @@ pub fn metrics(world:&mut World) -> Metrics {
 pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path:&Path) -> Result<(),String> {
     use std::fmt::Write;
     if let Some(parent)=path.parent().filter(|p|!p.as_os_str().is_empty()) { fs::create_dir_all(parent).map_err(|e|e.to_string())?; }
-    let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops,spatial_us,neighbor_peak,bucket_peak,neighbor_queries,neighbor_entries,pair_candidates,neighbor_truncated,dense_bucket_events,large_bounds,fallback_queries\n");
+    let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops,spatial_us,neighbor_peak,bucket_peak,neighbor_queries,neighbor_entries,pair_candidates,neighbor_truncated,dense_bucket_events,large_bounds,fallback_queries,reservation_count,frozen_targets,waiting_space,waiting_entrance,blocked_near_path,command_plan_us,formation_us,entry_refinements\n");
     for m in samples {
         let timing=|v:u128|if m.timing_ready {v.to_string()} else {"not-ready".into()};
         let contacts=if m.collision_ready {format!("{:.6},{},{},{},{},{}",m.swept_penetration,
@@ -245,18 +258,21 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
         let spatial=if m.collision_ready {format!("{},{},{},{},{},{},{},{},{},{}",(s.build_time+s.query_time).as_micros(),s.peak_neighbors,
             s.peak_bucket,s.queries,s.visited_entries,s.candidate_pairs,s.truncated,s.dense_bucket_events,s.large_bounds,s.fallback_queries)}
             else {"not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready".into()};
-        writeln!(csv,"{},{:.6},{},{},not-ready,not-ready,{},{:.6},{:.6},{},{},{},{},{},{},{},{:016x},{},{},{}",
+        let formation=format!("{},{},{},{},{},{},{},{}",m.reserved,m.frozen_targets,m.waiting_space,m.waiting_entrance,m.blocked_near,m.planning_us,timing(m.formation_us),m.entry_refinements);
+        writeln!(csv,"{},{:.6},{},{},not-ready,not-ready,{},{:.6},{:.6},{},{},{},{},{},{},{},{:016x},{},{},{},{}",
             m.tick,m.tick as f64/TICK_HZ,m.active,m.moved,m.legacy_stalled,m.max_still_seconds,m.overlap_end,
             m.bad_centers,timing(m.total_us),timing(m.snapshot_us),timing(m.pressure_us),timing(m.velocity_us),timing(m.contact_us),timing(m.writeback_us),m.digest,
-            m.collision_ready,contacts,spatial).unwrap();
+            m.collision_ready,contacts,spatial,formation).unwrap();
     }
     fs::write(path,csv).map_err(|e|e.to_string())?;
     fs::write(path.with_extension("scene.ini"),config.encode()).map_err(|e|e.to_string())?;
     let mut units:Vec<_>=world.query::<&Unit>().iter(world).cloned().collect();units.sort_by_key(|u|u.idx);
-    let mut snapshot=String::from("id,group,command,x,y,vx,vy,goal_x,goal_y,still_ticks,stall_ticks\n");
-    for u in units { writeln!(snapshot,"{},{},{},{:.9},{:.9},{:.9},{:.9},{},{},{},{}",u.idx,
+    let mut snapshot=String::from("id,group,command,x,y,vx,vy,goal_x,goal_y,still_ticks,stall_ticks,parking_x,parking_y,parking_valid,parking_frozen,target_block\n");
+    for u in units {
+        let parking=u.parking.as_ref().map_or("none,none,false,false,none".into(),|t|format!("{:.9},{:.9},{},{},{:?}",t.position.x,t.position.y,t.valid,t.frozen,t.blocked));
+        writeln!(snapshot,"{},{},{},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{}",u.idx,
         u.idx as usize/config.per_group,u.command_id.map_or(0,|c|c.0),u.cell_x,u.cell_y,u.vx,u.vy,
-        u.goal.x,u.goal.y,u.still_ticks,u.stall_ticks).unwrap(); }
+        u.goal.x,u.goal.y,u.still_ticks,u.stall_ticks,parking).unwrap(); }
     fs::write(path.with_extension("units.csv"),snapshot).map_err(|e|e.to_string())?;
     Ok(())
 }

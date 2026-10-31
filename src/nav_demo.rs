@@ -143,8 +143,8 @@ fn save(world:&mut World) {
 
 fn input(world:&mut World) {
     let keys=world.resource::<ButtonInput<KeyCode>>();
-    let (pause,step,restart,save_now,exit)=(keys.just_pressed(KeyCode::Space),keys.just_pressed(KeyCode::KeyN),
-        keys.just_pressed(KeyCode::KeyR),keys.just_pressed(KeyCode::KeyS),keys.just_pressed(KeyCode::Escape));
+    let (pause,step,restart,save_now,exit,cancel)=(keys.just_pressed(KeyCode::Space),keys.just_pressed(KeyCode::KeyN),
+        keys.just_pressed(KeyCode::KeyR),keys.just_pressed(KeyCode::KeyS),keys.just_pressed(KeyCode::Escape),keys.just_pressed(KeyCode::KeyX));
     let count=if keys.just_pressed(KeyCode::Digit1) {Some(64)} else if keys.just_pressed(KeyCode::Digit2) {Some(256)}
         else if keys.just_pressed(KeyCode::Digit3) {Some(1024)} else {None};
     let kind=if keys.just_pressed(KeyCode::F1) {Some(SceneKind::Crossing)} else if keys.just_pressed(KeyCode::F2) {Some(SceneKind::HeadOn)}
@@ -159,6 +159,12 @@ fn input(world:&mut World) {
         if mode {state.config.continuous=!state.config.continuous;}
     }
     if restart||count.is_some()||kind.is_some()||mode {reset(world);}
+    if cancel {
+        world.resource_mut::<crate::play::Selection>().0=world.query_filtered::<Entity,With<Unit>>().iter(world).collect();
+        let n=crate::play::cancel_selected(world);world.resource_mut::<crate::play::Selection>().0.clear();
+        let latest=nav_scenario::metrics(world);world.resource_mut::<DemoState>().latest=latest;
+        println!("event=cancel units={n}");
+    }
     if save_now {save(world);}
     if exit {world.write_message(AppExit::Success);}
 }
@@ -175,13 +181,14 @@ fn update_hud(time:Res<Time>,env:Res<SimEnv>,mut state:ResMut<DemoState>,mut tex
     let fps=if state.fps>0.0 {format!("{:.1} FPS",state.fps)} else {"warming up".into()};
     if let Ok(mut text)=text.single_mut() {
         text.0=format!("Navigation | {} | {} | {} | {} units | seed {} jitter {} | tick {} | {}\n\
-            Space pause | N step | R reset | 1/2/3=64/256/1024 | F1 cross F2 head-on F3 single | Tab mode | S save | Esc close\n\
+            Space pause | N step | R reset | 1/2/3=64/256/1024 | F1 cross F2 head-on F3 single | Tab mode | S save | X cancel | Esc close\n\
             A red  B blue  C green  D gold | commands active {} | moving {} | legacy stalls {} | max still {:.2}s\n\
-            Arrival: NOT READY | Waiting reason: NOT READY | sample tick {} | overlap(end) {:.4} | core {}\n\
-            digest {:016x}",
+            Arrival: NOT READY | sample tick {} | overlap(end) {:.4} | core {}\n\
+            Reserved {} | frozen {} | space wait {} | entrance wait {} | blocked local path {} | digest {:016x}",
             state.config.kind.name(),state.config.mode(),if state.paused {"PAUSED"} else {"RUNNING"},
             state.config.per_group*state.config.kind.routes().len(),state.config.seed,state.config.jitter,env.tick,fps,
-            m.active,m.moved,m.legacy_stalled,m.max_still_seconds,m.tick,m.overlap_end,core,m.digest);
+            m.active,m.moved,m.legacy_stalled,m.max_still_seconds,m.tick,m.overlap_end,core,
+            m.reserved,m.frozen_targets,m.waiting_space,m.waiting_entrance,m.blocked_near,m.digest);
     }
 }
 
@@ -221,6 +228,9 @@ mod tests {
         press(&mut app,KeyCode::F3);assert_eq!(app.world_mut().query::<&Unit>().iter(app.world()).count(),256);
         press(&mut app,KeyCode::Tab);assert!(!app.world().resource::<SimEnv>().use_crowd);
         press(&mut app,KeyCode::Tab);assert!(app.world().resource::<SimEnv>().use_crowd);
+        press(&mut app,KeyCode::KeyX);assert!(app.world().resource::<SimEnv>().reservations.claims.is_empty());
+        assert!(app.world_mut().query::<&Unit>().iter(app.world()).all(|u|u.command_id.is_none()));
+        press(&mut app,KeyCode::KeyR);assert!(!app.world().resource::<SimEnv>().reservations.claims.is_empty());
         press(&mut app,KeyCode::Digit1);press(&mut app,KeyCode::F1);
         assert_eq!(app.world_mut().query::<&Unit>().iter(app.world()).count(),256);
         assert_eq!(app.world().resource::<SimEnv>().tick,0);

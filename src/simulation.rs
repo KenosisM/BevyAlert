@@ -12,6 +12,10 @@ use crate::world::{SimEnv, Unit, aim_turret, turn_toward};
 pub struct Buffers {
     pub agents:Vec<crowd::Agent>,pub snapshot:Vec<crowd::Agent>,
     pub velocity_index:crate::spatial::Index,pub contacts:crate::collision::Workspace,
+    pub formation_positions:Vec<(i32,bevy::math::Vec2,Option<CommandId>)>,
+    pub idle_bodies:Vec<crate::formation::Body>,pub idle_index:crate::spatial::Index,
+    pub idle_bounds:Vec<crate::spatial::Aabb>,pub idle_neighbors:Vec<usize>,
+    pub local_routes:crate::local_nav::Routes,
     bounds:Vec<crate::spatial::Aabb>,neighbors:Vec<usize>,
 }
 
@@ -39,6 +43,7 @@ pub struct PhaseTimes {
     pub writeback: Duration,
     pub total: Duration,
     pub spatial: Duration,
+    pub formation: Duration,
 }
 
 /// A sampled event, kept in memory. Sampling performs no file or console I/O.
@@ -95,10 +100,12 @@ impl Runtime {
 /// Timings and samples are observations and never feed simulation decisions.
 pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     if !env.use_crowd || env.nav.cost.is_empty() { return; }
+    let total = Instant::now();
     units.sort_by_key(|u| u.idx);
     assert!(units.windows(2).all(|p| p[0].idx != p[1].idx), "duplicate simulation unit ID");
+    crate::formation::maintain(env,units);
+    let formation_time=total.elapsed();
     let dt = env.runtime.dt();
-    let total = Instant::now();
     let phase = Instant::now();
     // ---- 1. 快照：位置 / 路权 / 半径 ----------------------------------------
     let mut buffers=std::mem::take(&mut env.buffers);
@@ -118,16 +125,19 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             }
             _ => 0.0,
         };
-        let settled = u.goal.x < 0
+        let settled = if let Some(t)=&u.parking {
+            t.valid&&t.blocked.is_none()&&crate::formation::position(u).distance(t.position)<crate::formation::POINT_REACH_RADIUS
+        }else {u.goal.x < 0
             || (u.goal.x >= 0
                 && (u.cell_x - u.goal.x as f32).abs() < env.crowd_params.arrive_radius
-                && (u.cell_y - u.goal.y as f32).abs() < env.crowd_params.arrive_radius);
+                && (u.cell_y - u.goal.y as f32).abs() < env.crowd_params.arrive_radius)};
         agents.push(crowd::Agent {
+            group: u.parking.as_ref().and(u.command_id).map(|id|id.0),
             x: u.cell_x,
             y: u.cell_y,
             speed: u.speed,
             priority: -remaining,
-            radius: 0.45,
+            radius: u.parking.as_ref().map_or(env.crowd_params.radius_default(),|t|t.radius),
             settled: settled || !u.on_ground,
             vx: u.vx,
             vy: u.vy,
@@ -156,19 +166,31 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     // ---- 3. 速度层：算出每辆车的期望速度，把位置先推到快照里 ----------------
     buffers.snapshot.clear();buffers.snapshot.extend_from_slice(agents);let snapshot=&buffers.snapshot;
     let dt_safe = dt.max(1e-4);
-    for (i, u) in units.iter().enumerate() {
+    for (i, u) in units.iter_mut().enumerate() {
         if !u.on_ground || u.goal.x < 0 || agents[i].settled {
             continue;
         }
-        let goal = (u.goal.x as f32, u.goal.y as f32);
-        let mut dir = long_range_dir(&env.nav, u, &snapshot[i], goal);
+        let parking=crate::formation::parking_position(u);let goal=(parking.x,parking.y);
+        let mut query=crate::local_nav::Query{grid:&env.nav,bodies:&buffers.idle_bodies,index:&mut buffers.idle_index,
+            neighbors:&mut buffers.idle_neighbors,owner:u.idx,radius:agents[i].radius,max_radius};
+        let local=crate::formation::direction(u,bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),env.tick,&mut query,&mut buffers.local_routes);
+        let mut dir = if let Some(v)=local {(v.x,v.y)}else{long_range_dir(&env.nav,u,&snapshot[i],goal)};
         // 保留原有切向逃逸，直到显式停滞恢复接管。
-        if u.escape_ticks > 0 {
+        if u.escape_ticks > 0&&!u.parking.as_ref().is_some_and(|t|t.local_active) {
             dir = crowd::rotate90(dir, u.escape_side);
         }
         let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,
             dt,env.crowd_params.neighbor_radius.max(1.2));
         buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
+        let goal=crate::formation::motion_goal(u);let goal=(goal.x,goal.y);
+        let mut steering_params=env.crowd_params;
+        if u.parking.is_some() {
+            steering_params.arrive_radius=crate::formation::POINT_REACH_RADIUS;
+            // Exclusive positions replace the legacy bowl's compaction pressure.
+            // Applying it during a long shared-field march destroys lateral order;
+            // separation, encounter steering and continuous contact guards remain.
+            steering_params.press_weight=0.0;
+        }
         let (vx, vy) = crowd::step_agent(
             i,
             snapshot,
@@ -176,7 +198,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             dir,
             goal,
             &env.pressure,
-            &env.crowd_params,
+            &steering_params,
             dt,
         );
         let from = (agents[i].x, agents[i].y);
@@ -191,6 +213,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     // 速度层只能把稳态压到「软重叠」——期望速度一直在往里顶。这一层是硬约束。
     crate::collision::finish_motion_with_workspace(snapshot,agents,&env.nav,&mut buffers.contacts,&mut env.runtime.contacts);
     let mut spatial_stats=buffers.velocity_index.stats.clone();
+    spatial_stats.merge(&buffers.idle_index.stats);
     spatial_stats.merge(&buffers.contacts.projection_index.stats);spatial_stats.merge(&buffers.contacts.trajectory_index.stats);
     env.runtime.spatial_stats=spatial_stats;
 
@@ -220,6 +243,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         u.cell_y = agents[i].y;
         u.vx = dx / dt_safe;
         u.vy = dy / dt_safe;
+        u.contact_hold=env.runtime.contacts.reasons[i]==crate::collision::Blocked::SafetyStop;
         u.path.clear();
         u.leg_t = 0.0;
 
@@ -279,7 +303,8 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     if env.runtime.sample_every > 0 && env.tick % env.runtime.sample_every == 0 {
         let times = PhaseTimes { snapshot: snapshot_time, pressure: pressure_time,
             velocity: velocity_time, contact: contact_time, writeback: phase.elapsed(),
-            total: total.elapsed(),spatial:env.runtime.spatial_stats.build_time+env.runtime.spatial_stats.query_time };
+            total: total.elapsed(),spatial:env.runtime.spatial_stats.build_time+env.runtime.spatial_stats.query_time,
+            formation:formation_time };
         env.runtime.last_sample = Some(TickSample {
             tick: env.tick, seed: env.runtime.seed,
             units: units.iter().map(|u| UnitSample {
@@ -295,7 +320,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
 }
 
 /// 长程方向：场里 8 邻域的最省格；没有场就直指目标。
-fn long_range_dir(grid:&nav::CostGrid, u: &Unit, me: &crowd::Agent, goal: (f32, f32)) -> (f32, f32) {
+fn long_range_dir(grid:&nav::CostGrid, u: &mut Unit, me: &crowd::Agent, goal: (f32, f32)) -> (f32, f32) {
     let fallback = {
         let dx = goal.0 - me.x;
         let dy = goal.1 - me.y;

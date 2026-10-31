@@ -832,6 +832,7 @@ pub fn run(args: Vec<String>) {
         tick: 0,
         runtime,
         buffers: crate::simulation::Buffers::default(),
+        reservations: crate::formation::Reservations::default(),
         // 连续运动层（路线 C）。想退回旧的离散重力碗做对照，把这里改成 false。
         // ⚠️ 暂时回到旧的离散重力碗：新的连续运动层还没在真实地图上验过，
         // 已知问题：脚本指令下单位可能不动。改 true 就切回新系统。
@@ -1676,9 +1677,12 @@ fn select_all_initial(mut sel: ResMut<Selection>, q: Query<Entity, With<Unit>>) 
 /// 执行排队中的指令。exclusive：`issue_order_at` 要 `&mut World`。
 fn auto_order(world: &mut World) {
     let dest = { world.resource_mut::<PendingOrder>().0.take() };
+    if world.get_resource::<ButtonInput<KeyCode>>().is_some_and(|keys|keys.just_pressed(KeyCode::KeyX)) {
+        let count=play::cancel_selected(world);println!("cancel -> {count} selected units");return;
+    }
     if let Some(d) = dest {
-        let n = play::issue_order_at(world, d);
-        println!("order -> ({},{}) : {n} units pathed", d.x, d.y);
+        let report = play::issue_order(world, d);
+        println!("order -> ({},{}) : {report:?}", d.x, d.y);
     }
 }
 
