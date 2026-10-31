@@ -2,6 +2,7 @@ mod blowfish_tables;
 mod compress;
 mod costgrid;
 mod crowd;
+mod orca;
 mod arrival;
 mod formation;
 mod collision;
