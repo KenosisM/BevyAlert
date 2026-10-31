@@ -14,13 +14,15 @@
 //!   3. **压力场（pressure，解耦）**：单独的拥挤度标量场，只作用于速度，
 //!      **绝不进 A*/流场的代价** —— 进了就会让箭头每帧翻转，单位原地抽搐。
 //!
-//! 运动学：`pos += v * dt`，最后夹回可行走格；出界/撞墙就退一步试单轴，再不行就不动。
+//! 速度提议交给 `collision` 执行带半径扫掠、接触约束与轨迹检查，再写回正式位置。
 
 use crate::nav::CostGrid;
 
 /// 一个 agent 的快照（每 tick 建一次，供邻居查询用）。
 #[derive(Clone, Copy, Debug)]
 pub struct Agent {
+    /// Shared formation command, only for units with exclusive parking targets.
+    pub group: Option<u64>,
     pub x: f32,
     pub y: f32,
     pub speed: f32,
@@ -40,6 +42,7 @@ pub struct Agent {
 impl Default for Agent {
     fn default() -> Self {
         Agent {
+            group: None,
             x: 0.0,
             y: 0.0,
             speed: 6.0,
@@ -199,12 +202,19 @@ fn norm(x: f32, y: f32) -> (f32, f32) {
 pub fn step_agent(
     i: usize,
     agents: &[Agent],
+    neighbors: &[usize],
     desired_dir: (f32, f32),
     goal: (f32, f32),
     pressure: &Pressure,
     params: &Params,
     _dt: f32,
 ) -> (f32, f32) {
+    step_agent_preferred(i,agents,neighbors,desired_dir,goal,pressure,params,_dt,None)
+}
+
+/// Exclusive parking supplies path-based braking; legacy callers retain their old curve.
+pub fn step_agent_preferred(i:usize,agents:&[Agent],neighbors:&[usize],desired_dir:(f32,f32),goal:(f32,f32),
+    pressure:&Pressure,params:&Params,_dt:f32,preferred_speed:Option<f32>)->(f32,f32) {
     let me = agents[i];
 
     let to_goal = (goal.0 - me.x, goal.1 - me.y);
@@ -214,10 +224,11 @@ pub fn step_agent(
     }
 
     // ---- 长程期望速度 --------------------------------------------------------
-    let mut vx = desired_dir.0 * me.speed;
-    let mut vy = desired_dir.1 * me.speed;
+    let preferred=preferred_speed.unwrap_or(me.speed).max(0.0);
+    let mut vx = desired_dir.0 * preferred;
+    let mut vy = desired_dir.1 * preferred;
     // 快到了就减速，避免冲过终点再掉头（这是「抽搐」的常见来源之一）
-    let brake = (goal_dist / 1.5).clamp(0.25, 1.0);
+    let brake = if preferred_speed.is_some(){1.0}else{(goal_dist / 1.5).clamp(0.25, 1.0)};
     vx *= brake;
     vy *= brake;
 
@@ -226,7 +237,8 @@ pub fn step_agent(
     let mut sy = 0.0;
     let mut touching = false;  // 有没有被人挤到（挤到时不让加速度限幅拖慢反应）
     let r = me.radius.max(0.05);
-    for (j, other) in agents.iter().enumerate() {
+    for &j in neighbors {
+        let other=&agents[j];
         if j == i {
             continue;
         }
@@ -264,6 +276,11 @@ pub fn step_agent(
         // (2) 路权：谁该让。priority 越大越优先。
         //     我让：主动横向偏转（垂直于相对速度，方向选「远离对方」的那侧）
         //     他让：我只做很小的一点偏转，别为了躲他跑偏
+        // Exclusive teammates use their local parking paths around stationary
+        // owners. Artificial side yield against a parked row (or parallel traffic)
+        // would push followers out of their still-free arrival columns.
+        if me.group.is_some()&&me.group==other.group
+            &&(other.settled||me.vx*other.vx+me.vy*other.vy>0.0) {continue;}
         let approach = vx * (-ux) + vy * (-uy); // >0 表示我在朝他走
         if approach > 0.0 {
             let right_of_way = me.priority >= other.priority;
@@ -303,7 +320,8 @@ pub fn step_agent(
     // 不加这条会和分离力「拔河」：一直往人堆里顶，最终稳态距离就落在半重叠上。
     // 这里按邻域里挤进来的人数压低期望速度，人少了自动恢复。
     let mut crowding = 0.0f32;
-    for (j, other) in agents.iter().enumerate() {
+    for &j in neighbors {
+        let other=&agents[j];
         if j == i || other.settled && me.settled {
             continue;
         }
@@ -341,89 +359,44 @@ pub fn step_agent(
     clamp_speed(vx, vy, cap)
 }
 
-/// 位置修正：把互相重叠的圆盘直接推开（PBD 风格）。
-///
-/// 速度层的分离力只能把稳态距离压到「软重叠」，因为期望速度一直在往里顶；
-/// 位置层是硬约束，直接解决它。跑两三轮就够 —— 每轮每对只分一次。
-///
-/// 站定的一方只承担 1/4 的位移（它没有意愿动），移动的一方承担 3/4。
-pub fn resolve_overlaps(agents: &mut [Agent], grid: &CostGrid, min_dist: f32, iterations: u32) {
-    let n = agents.len();
-    if n < 2 || min_dist <= 0.0 {
-        return;
-    }
-    for _ in 0..iterations {
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let dx = agents[j].x - agents[i].x;
-                let dy = agents[j].y - agents[i].y;
-                let d2 = dx * dx + dy * dy;
-                if d2 >= min_dist * min_dist {
-                    continue;
-                }
-                let d = d2.sqrt();
-                // 完全重合：用一个确定的伪随机方向拆开，避免 NaN 和「谁都不动」
-                let (ux, uy) = if d > 1e-5 {
-                    (dx / d, dy / d)
-                } else {
-                    let a = (i as f32) * 2.399963; // 黄金角，分布均匀
-                    (a.cos(), a.sin())
-                };
-                let overlap = min_dist - d;
-                // 责任分摊试过 RVO2 式的不对称 α（按路权 0.65/0.35）：静止堆会缓慢平移，
-                // 因为优先级每 tick 都在变，摊派权重也跟着变。回到对称 + “站定者少动”。
-                let (wi, wj) = match (agents[i].settled, agents[j].settled) {
-                    (true, true) => (0.5, 0.5),
-                    (true, false) => (0.25, 0.75),
-                    (false, true) => (0.75, 0.25),
-                    (false, false) => (0.5, 0.5),
-                };
-                agents[i].x -= ux * overlap * wi;
-                agents[i].y -= uy * overlap * wi;
-                agents[j].x += ux * overlap * wj;
-                agents[j].y += uy * overlap * wj;
-            }
-        }
-        // 推开后可能被推进墙里，夹回去
-        for a in agents.iter_mut() {
-            let (nx, ny) = resolve_position(grid, (a.x, a.y), (a.x, a.y));
-            a.x = nx;
-            a.y = ny;
-        }
-    }
+/// Compatibility entry for the legacy steering tests. Production also checks old->new
+/// pair trajectories with collision::finish_motion before any position is committed.
+#[cfg(test)]
+pub fn resolve_overlaps(agents: &mut [Agent], grid: &CostGrid, iterations: u32) {
+    crate::collision::project_contacts(agents,grid,iterations);
 }
 
-/// 把「想走到的位置」夹回可行走区。返回真正落地的新位置。
-///
-/// 依次尝试：整体 → 只沿 x → 只沿 y → 原地。这样贴着墙走不会整步丢光。
+/// Legacy steering helper using the same disc sweep as production.
+#[cfg(test)]
 pub fn resolve_position(
     grid: &CostGrid,
     from: (f32, f32),
     to: (f32, f32),
 ) -> (f32, f32) {
-    let ok = |x: f32, y: f32| -> bool {
-        let cx = x.round() as i32;
-        let cy = y.round() as i32;
-        if cx < 0 || cy < 0 || cx >= grid.w || cy >= grid.h {
-            return false;
-        }
-        grid.walkable(cx, cy)
-    };
-    if ok(to.0, to.1) {
-        return to;
-    }
-    if ok(to.0, from.1) {
-        return (to.0, from.1);
-    }
-    if ok(from.0, to.1) {
-        return (from.0, to.1);
-    }
-    from
+    let (p,_)=crate::collision::move_disc(grid,bevy::math::Vec2::new(from.0,from.1),
+        bevy::math::Vec2::new(to.0,to.1),0.45);
+    (p.x,p.y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_formation_members_do_not_receive_crossing_side_yield() {
+        let agents=vec![Agent{group:Some(1),x:4.0,y:4.0,vx:6.0,..Agent::default()},
+            Agent{group:Some(1),x:5.1,y:4.0,vx:6.0,..Agent::default()}];
+        let velocity=step_agent(0,&agents,&[0,1],(1.0,0.0),(25.0,4.0),&Pressure::default(),&Params::default(),1.0/60.0);
+        assert!(velocity.0>0.0);assert!(velocity.1.abs()<1e-6);
+    }
+
+    #[test]
+    fn a_parked_teammate_beyond_the_exclusive_goal_does_not_deflect_its_follower() {
+        let agents=vec![Agent{group:Some(1),x:4.0,y:4.0,vx:4.0,..Agent::default()},
+            Agent{group:Some(1),x:5.65,y:4.0,settled:true,..Agent::default()}];
+        let velocity=step_agent(0,&agents,&[0,1],(1.0,0.0),(4.55,4.0),&Pressure::default(),&Params::default(),1.0/60.0);
+        assert!(velocity.0>0.0);assert!(velocity.1.abs()<1e-6);
+    }
 
     fn flat_grid(w: i32, h: i32) -> CostGrid {
         let mut g = CostGrid::default();
@@ -486,7 +459,8 @@ mod tests {
             let snapshot = agents.clone();
             for i in 0..n {
                 let dir = norm(goal.0 - snapshot[i].x, goal.1 - snapshot[i].y);
-                let (vx, vy) = step_agent(i, &snapshot, dir, goal, &pressure, &params, dt);
+                let neighbors:Vec<_>=(0..snapshot.len()).collect(); // test-only brute-force reference
+                let (vx, vy) = step_agent(i, &snapshot, &neighbors, dir, goal, &pressure, &params, dt);
                 let from = (agents[i].x, agents[i].y);
                 let to = (from.0 + vx * dt, from.1 + vy * dt);
                 let (_nx, _ny) = resolve_position(&grid, from, to);
@@ -498,7 +472,7 @@ mod tests {
                     last_moved[i] = tick;
                 }
             }
-            resolve_overlaps(&mut agents, &grid, 0.9, 2);
+            resolve_overlaps(&mut agents, &grid, 2);
             // 全部到位就可以提前结束
             if agents.iter().all(|a| {
                 ((goal.0 - a.x).powi(2) + (goal.1 - a.y).powi(2)).sqrt() <= 1.5
@@ -528,7 +502,8 @@ mod tests {
             let snapshot = agents.clone();
             for i in 0..n {
                 let dir = norm(goal.0 - snapshot[i].x, goal.1 - snapshot[i].y);
-                let (vx, vy) = step_agent(i, &snapshot, dir, goal, &pressure, &params, dt);
+                let neighbors:Vec<_>=(0..snapshot.len()).collect(); // test-only brute-force reference
+                let (vx, vy) = step_agent(i, &snapshot, &neighbors, dir, goal, &pressure, &params, dt);
                 let from = (agents[i].x, agents[i].y);
                 let to = (from.0 + vx * dt, from.1 + vy * dt);
                 let (nx, ny) = resolve_position(&grid, from, to);

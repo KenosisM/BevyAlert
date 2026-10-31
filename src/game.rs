@@ -789,7 +789,9 @@ pub fn run(args: Vec<String>) {
 
     // --- 出生点：在 from 附近用编队格铺开 --------------------------------------------
     let start_default = Cell::new(gw / 4 + 2, gh / 4 + 2);
-    let start = play::nearest_usable(&raw_grid, from.unwrap_or(start_default));
+    let Some(start)=play::nearest_usable(&nav_grid,from.unwrap_or(start_default)) else {
+        eprintln!("no legal spawn cell");return;
+    };
     let mut spawn_cells = nav::formation_cells(&nav_grid, &footprint, start, units_n);
     if spawn_cells.is_empty() {
         spawn_cells.push(start);
@@ -820,13 +822,17 @@ pub fn run(args: Vec<String>) {
         clear = [0.0, 0.0, 0.0];
     }
     app.insert_resource(ClearColor(Color::srgb(clear[0], clear[1], clear[2])));
-    app.insert_resource(Time::<Fixed>::from_hz(cfg.tick_hz as f64));
+    let runtime = crate::simulation::Runtime::from_hz(cfg.tick_hz as f64, 0);
+    app.insert_resource(Time::<Fixed>::from_duration(runtime.fixed_step()));
     app.insert_resource(SimEnv {
         ground: gf,
         nav: nav_grid,
         footprint,
         occupied: Vec::new(),
         tick: 0,
+        runtime,
+        buffers: crate::simulation::Buffers::default(),
+        reservations: crate::formation::Reservations::default(),
         // 连续运动层（路线 C）。想退回旧的离散重力碗做对照，把这里改成 false。
         // ⚠️ 暂时回到旧的离散重力碗：新的连续运动层还没在真实地图上验过，
         // 已知问题：脚本指令下单位可能不动。改 true 就切回新系统。
@@ -1671,9 +1677,18 @@ fn select_all_initial(mut sel: ResMut<Selection>, q: Query<Entity, With<Unit>>) 
 /// 执行排队中的指令。exclusive：`issue_order_at` 要 `&mut World`。
 fn auto_order(world: &mut World) {
     let dest = { world.resource_mut::<PendingOrder>().0.take() };
+    if world.get_resource::<ButtonInput<KeyCode>>().is_some_and(|keys|keys.just_pressed(KeyCode::KeyX)) {
+        let count=play::cancel_selected(world);println!("cancel -> {count} selected units");return;
+    }
+    if world.get_resource::<ButtonInput<KeyCode>>().is_some_and(|keys|keys.just_pressed(KeyCode::KeyH)) {
+        let count=play::stop_selected(world);println!("stop -> {count} selected units");return;
+    }
+    if world.get_resource::<ButtonInput<KeyCode>>().is_some_and(|keys|keys.just_pressed(KeyCode::KeyU)) {
+        let count=play::wake_selected(world,crate::arrival::WakeReason::Resume);println!("resume -> {count} selected units");return;
+    }
     if let Some(d) = dest {
-        let n = play::issue_order_at(world, d);
-        println!("order -> ({},{}) : {n} units pathed", d.x, d.y);
+        let report = play::issue_order(world, d);
+        println!("order -> ({},{}) : {report:?}", d.x, d.y);
     }
 }
 
