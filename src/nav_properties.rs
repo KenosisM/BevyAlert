@@ -109,8 +109,10 @@ fn actual_legacy_step_and_continuous_integration_refuse_a_sealed_corner() {
     world.insert_resource(SimEnv{nav:g.clone(),ground:GroundField{w:2,h:2,level:vec![0;4],..default()},use_crowd:false,..default()});
     let e=world.spawn(Unit{idx:0,goal:Cell::new(1,1),guide:Some(Arc::new(fake)),..default()}).id();let mut s=Schedule::default();s.add_systems(world::update_sim);
     for _ in 0..120{s.run(&mut world);}let u=world.get::<Unit>(e).unwrap();assert_eq!((u.cell_x,u.cell_y),(0.0,0.0));
-    assert_eq!(crate::crowd::resolve_position(&g,(0.0,0.0),(1.0,1.0)),(0.0,0.0));
-    assert_eq!(crate::crowd::resolve_position(&grid(5,1,vec![1,1,0,1,1],false),(0.0,0.0),(4.0,0.0)),(0.0,0.0));
+    let p=crate::crowd::resolve_position(&g,(0.0,0.0),(1.0,1.0));
+    assert!(p.0<0.06&&p.1<0.06);assert!(nav::segment_allowed(&g,(0.0,0.0),p));
+    let g=grid(5,1,vec![1,1,0,1,1],false);let p=crate::crowd::resolve_position(&g,(0.0,0.0),(4.0,0.0));
+    assert!(p.0<1.051&&p.1==0.0);assert!(nav::segment_allowed(&g,(0.0,0.0),p));
 }
 
 #[test]

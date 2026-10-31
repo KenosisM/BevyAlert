@@ -48,6 +48,7 @@
 | `debugview.rs` | 逻辑模式覆盖层：悬停黄框 / 信息面板 / 俯视按钮 |
 | `world.rs` | 模拟世界 / `GroundField` |
 | `nav.rs` | 共享通行与有向代价 / 最短路 / 流场 / 足迹 |
+| `collision.rs` | 带半径连续扫掠、受限接触修正及安全停车诊断；见 [碰撞安全](COLLISION.md) |
 | `nav_properties.rs` | 共享有向边、独立最短路基准及真实移动回归；见 [导航规则](NAVIGATION.md) |
 | `simulation.rs` / `nav_headless.rs` | 窗口与无头共用的固定步长核心、采样事件和可复现输入；见 [模拟入口](SIMULATION.md) |
 | `nav_scenario.rs` / `nav_demo.rs` | 四色四群同步演示、场景配置与机器可读基线；见 [四群演示](NAV_DEMO.md) |

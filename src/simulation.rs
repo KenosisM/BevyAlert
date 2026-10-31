@@ -1,7 +1,7 @@
 //! Fixed-step continuous simulation shared by ECS and asset-free headless runs.
 //!
 //! Unit and SimEnv are data at this boundary; this module never queries ECS.
-//! The legacy steering/contact behavior is retained until its dedicated fixes.
+//! Legacy steering proposes motion; collision checks constrain the committed trajectories.
 
 use std::time::{Duration, Instant};
 use crate::crowd;
@@ -57,6 +57,8 @@ pub struct Runtime {
     /// Zero disables samples. The caller chooses whether/how to persist them.
     pub sample_every: u64,
     pub last_sample: Option<TickSample>,
+    /// Last completed contact check, including conservative stops and unresolved initial overlaps.
+    pub contacts: crate::collision::ContactReport,
 }
 
 impl Default for Runtime {
@@ -68,7 +70,8 @@ impl Runtime {
         assert!(hz.is_finite() && hz > 0.0, "simulation rate must be positive and finite");
         let fixed_step = Duration::from_secs_f64(1.0 / hz);
         assert!(!fixed_step.is_zero(), "simulation timestep must be nonzero");
-        Self { fixed_step, seed, next_command: 1, sample_every: 0, last_sample: None }
+        Self { fixed_step, seed, next_command: 1, sample_every: 0, last_sample: None,
+            contacts: crate::collision::ContactReport::default() }
     }
     pub fn fixed_step(&self) -> Duration { self.fixed_step }
     pub fn dt(&self) -> f32 { self.fixed_step.as_secs_f32() }
@@ -157,9 +160,8 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             dt,
         );
         let from = (agents[i].x, agents[i].y);
-        let (nx, ny) = crowd::resolve_position(&env.nav, from, (from.0 + vx * dt, from.1 + vy * dt));
-        agents[i].x = nx;
-        agents[i].y = ny;
+        agents[i].x = from.0+vx*dt;
+        agents[i].y = from.1+vy*dt;
     }
 
     let velocity_time = phase.elapsed();
@@ -167,8 +169,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
 
     // ---- 4. 位置修正层：把重叠的圆盘直接推开 --------------------------------
     // 速度层只能把稳态压到「软重叠」——期望速度一直在往里顶。这一层是硬约束。
-    let min_dist = env.crowd_params.radius_default() * 2.0;
-    crowd::resolve_overlaps(&mut agents, &env.nav, min_dist, 2);
+    env.runtime.contacts=crate::collision::finish_motion(&snapshot,&mut agents,&env.nav);
 
     let contact_time = phase.elapsed();
     let phase = Instant::now();

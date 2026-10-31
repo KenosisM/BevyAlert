@@ -2,6 +2,7 @@ mod blowfish_tables;
 mod compress;
 mod costgrid;
 mod crowd;
+mod collision;
 mod debugview;
 mod game;
 mod hva;

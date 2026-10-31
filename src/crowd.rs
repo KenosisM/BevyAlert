@@ -14,7 +14,7 @@
 //!   3. **压力场（pressure，解耦）**：单独的拥挤度标量场，只作用于速度，
 //!      **绝不进 A*/流场的代价** —— 进了就会让箭头每帧翻转，单位原地抽搐。
 //!
-//! 运动学：`pos += v * dt`，最后夹回可行走格；出界/撞墙就退一步试单轴，再不行就不动。
+//! 速度提议交给 `collision` 执行带半径扫掠、接触约束与轨迹检查，再写回正式位置。
 
 use crate::nav::CostGrid;
 
@@ -341,77 +341,21 @@ pub fn step_agent(
     clamp_speed(vx, vy, cap)
 }
 
-/// 位置修正：把互相重叠的圆盘直接推开（PBD 风格）。
-///
-/// 速度层的分离力只能把稳态距离压到「软重叠」，因为期望速度一直在往里顶；
-/// 位置层是硬约束，直接解决它。跑两三轮就够 —— 每轮每对只分一次。
-///
-/// 站定的一方只承担 1/4 的位移（它没有意愿动），移动的一方承担 3/4。
-pub fn resolve_overlaps(agents: &mut [Agent], grid: &CostGrid, min_dist: f32, iterations: u32) {
-    let n = agents.len();
-    if n < 2 || min_dist <= 0.0 {
-        return;
-    }
-    for _ in 0..iterations {
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let dx = agents[j].x - agents[i].x;
-                let dy = agents[j].y - agents[i].y;
-                let d2 = dx * dx + dy * dy;
-                if d2 >= min_dist * min_dist {
-                    continue;
-                }
-                let d = d2.sqrt();
-                // 完全重合：用一个确定的伪随机方向拆开，避免 NaN 和「谁都不动」
-                let (ux, uy) = if d > 1e-5 {
-                    (dx / d, dy / d)
-                } else {
-                    let a = (i as f32) * 2.399963; // 黄金角，分布均匀
-                    (a.cos(), a.sin())
-                };
-                let overlap = min_dist - d;
-                // 责任分摊试过 RVO2 式的不对称 α（按路权 0.65/0.35）：静止堆会缓慢平移，
-                // 因为优先级每 tick 都在变，摊派权重也跟着变。回到对称 + “站定者少动”。
-                let (wi, wj) = match (agents[i].settled, agents[j].settled) {
-                    (true, true) => (0.5, 0.5),
-                    (true, false) => (0.25, 0.75),
-                    (false, true) => (0.75, 0.25),
-                    (false, false) => (0.5, 0.5),
-                };
-                agents[i].x -= ux * overlap * wi;
-                agents[i].y -= uy * overlap * wi;
-                agents[j].x += ux * overlap * wj;
-                agents[j].y += uy * overlap * wj;
-            }
-        }
-        // 推开后可能被推进墙里，夹回去
-        for a in agents.iter_mut() {
-            let (nx, ny) = resolve_position(grid, (a.x, a.y), (a.x, a.y));
-            a.x = nx;
-            a.y = ny;
-        }
-    }
+/// Compatibility entry for the legacy steering tests. Production also checks old->new
+/// pair trajectories with collision::finish_motion before any position is committed.
+pub fn resolve_overlaps(agents: &mut [Agent], grid: &CostGrid, iterations: u32) {
+    crate::collision::project_contacts(agents,grid,iterations);
 }
 
-/// 把「想走到的位置」夹回可行走区。返回真正落地的新位置。
-///
-/// 依次尝试：整体 → 只沿 x → 只沿 y → 原地。这样贴着墙走不会整步丢光。
+/// Legacy steering helper using the same disc sweep as production.
 pub fn resolve_position(
     grid: &CostGrid,
     from: (f32, f32),
     to: (f32, f32),
 ) -> (f32, f32) {
-    let ok=|x:f32,y:f32| crate::nav::segment_allowed(grid,from,(x,y));
-    if ok(to.0, to.1) {
-        return to;
-    }
-    if ok(to.0, from.1) {
-        return (to.0, from.1);
-    }
-    if ok(from.0, to.1) {
-        return (from.0, to.1);
-    }
-    from
+    let (p,_)=crate::collision::move_disc(grid,bevy::math::Vec2::new(from.0,from.1),
+        bevy::math::Vec2::new(to.0,to.1),0.45);
+    (p.x,p.y)
 }
 
 #[cfg(test)]
@@ -491,7 +435,7 @@ mod tests {
                     last_moved[i] = tick;
                 }
             }
-            resolve_overlaps(&mut agents, &grid, 0.9, 2);
+            resolve_overlaps(&mut agents, &grid, 2);
             // 全部到位就可以提前结束
             if agents.iter().all(|a| {
                 ((goal.0 - a.x).powi(2) + (goal.1 - a.y).powi(2)).sqrt() <= 1.5
