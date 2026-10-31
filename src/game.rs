@@ -831,6 +831,7 @@ pub fn run(args: Vec<String>) {
         occupied: Vec::new(),
         tick: 0,
         runtime,
+        buffers: crate::simulation::Buffers::default(),
         // 连续运动层（路线 C）。想退回旧的离散重力碗做对照，把这里改成 false。
         // ⚠️ 暂时回到旧的离散重力碗：新的连续运动层还没在真实地图上验过，
         // 已知问题：脚本指令下单位可能不动。改 true 就切回新系统。

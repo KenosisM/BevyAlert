@@ -21,6 +21,7 @@ mod ramp;
 mod rules;
 mod shp;
 mod simulation;
+mod spatial;
 mod terrain;
 mod theater;
 mod tilefix;

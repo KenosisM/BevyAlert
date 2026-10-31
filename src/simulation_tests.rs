@@ -23,6 +23,25 @@ fn fixture() -> (SimEnv, Vec<Unit>) {
     (SimEnv { nav, ..default() }, units)
 }
 
+#[test]
+fn indexed_and_brute_force_formal_motion_match_through_contacts_and_bucket_updates() {
+    let (mut fast,mut a)=fixture();let (mut reference,mut b)=fixture();
+    reference.buffers.velocity_index.brute_force=true;
+    reference.buffers.contacts.projection_index.brute_force=true;
+    reference.buffers.contacts.trajectory_index.brute_force=true;
+    for _ in 0..900 {
+        crate::simulation::step_continuous(&mut fast,&mut a);
+        crate::simulation::step_continuous(&mut reference,&mut b);
+        for (x,y) in a.iter().zip(&b) {
+            assert_eq!((x.cell_x.to_bits(),x.cell_y.to_bits(),x.vx.to_bits(),x.vy.to_bits(),x.stall_ticks),
+                (y.cell_x.to_bits(),y.cell_y.to_bits(),y.vx.to_bits(),y.vy.to_bits(),y.stall_ticks));
+        }
+        assert_eq!(fast.runtime.contacts.reasons,reference.runtime.contacts.reasons);
+        assert_eq!(fast.runtime.contacts.max_penetration,reference.runtime.contacts.max_penetration);
+    }
+    assert_eq!(fast.runtime.spatial_stats.truncated,0);
+}
+
 fn fingerprint(world: &mut World) -> u64 {
     let mut query = world.query::<&Unit>();
     let mut units: Vec<_> = query.iter(world).collect();

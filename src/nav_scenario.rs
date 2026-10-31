@@ -193,6 +193,7 @@ pub struct Metrics {
     pub swept_penetration:f32, pub unresolved_contacts:usize, pub illegal_trajectories:usize,
     pub limited_trajectories:usize, pub initial_overlaps:usize, pub safety_stops:usize,
     pub collision_ready:bool,
+    pub spatial:crate::spatial::Stats,
 }
 
 pub fn metrics(world:&mut World) -> Metrics {
@@ -200,6 +201,7 @@ pub fn metrics(world:&mut World) -> Metrics {
     let env=world.resource::<SimEnv>();
     let mut m=Metrics { tick:env.tick,..default() };
     let contacts=&env.runtime.contacts;
+    m.spatial=env.runtime.spatial_stats.clone();
     m.collision_ready=env.use_crowd&&env.tick>0;
     m.swept_penetration=contacts.max_swept_penetration;m.unresolved_contacts=contacts.unresolved_pairs;
     m.illegal_trajectories=contacts.illegal_static_trajectories;m.limited_trajectories=contacts.limited_trajectories;
@@ -215,10 +217,11 @@ pub fn metrics(world:&mut World) -> Metrics {
         for v in [u.idx as u32,u.cell_x.to_bits(),u.cell_y.to_bits(),u.vx.to_bits(),u.vy.to_bits(),u.stall_ticks,u.still_ticks] {
             digest=(digest^v as u64).wrapping_mul(0x100000001b3);
         }
-        for other in &units[i+1..] {
+        if !m.collision_ready {for other in &units[i+1..] {
             m.overlap_end=m.overlap_end.max((env.crowd_params.radius_default()*2.0-(u.cell_x-other.cell_x).hypot(u.cell_y-other.cell_y)).max(0.0));
-        }
+        }}
     }
+    if m.collision_ready {m.overlap_end=contacts.max_penetration;}
     m.digest=digest;
     if let Some(sample)=env.runtime.last_sample.as_ref().filter(|s|s.tick==env.tick) {
         m.timing_ready=true;
@@ -232,16 +235,20 @@ pub fn metrics(world:&mut World) -> Metrics {
 pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path:&Path) -> Result<(),String> {
     use std::fmt::Write;
     if let Some(parent)=path.parent().filter(|p|!p.as_os_str().is_empty()) { fs::create_dir_all(parent).map_err(|e|e.to_string())?; }
-    let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops\n");
+    let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops,spatial_us,neighbor_peak,bucket_peak,neighbor_queries,neighbor_entries,pair_candidates,neighbor_truncated,dense_bucket_events,large_bounds,fallback_queries\n");
     for m in samples {
         let timing=|v:u128|if m.timing_ready {v.to_string()} else {"not-ready".into()};
         let contacts=if m.collision_ready {format!("{:.6},{},{},{},{},{}",m.swept_penetration,
             m.unresolved_contacts,m.illegal_trajectories,m.limited_trajectories,m.initial_overlaps,m.safety_stops)}
             else {"not-ready,not-ready,not-ready,not-ready,not-ready,not-ready".into()};
-        writeln!(csv,"{},{:.6},{},{},not-ready,not-ready,{},{:.6},{:.6},{},{},{},{},{},{},{},{:016x},{},{}",
+        let s=&m.spatial;
+        let spatial=if m.collision_ready {format!("{},{},{},{},{},{},{},{},{},{}",(s.build_time+s.query_time).as_micros(),s.peak_neighbors,
+            s.peak_bucket,s.queries,s.visited_entries,s.candidate_pairs,s.truncated,s.dense_bucket_events,s.large_bounds,s.fallback_queries)}
+            else {"not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready,not-ready".into()};
+        writeln!(csv,"{},{:.6},{},{},not-ready,not-ready,{},{:.6},{:.6},{},{},{},{},{},{},{},{:016x},{},{},{}",
             m.tick,m.tick as f64/TICK_HZ,m.active,m.moved,m.legacy_stalled,m.max_still_seconds,m.overlap_end,
             m.bad_centers,timing(m.total_us),timing(m.snapshot_us),timing(m.pressure_us),timing(m.velocity_us),timing(m.contact_us),timing(m.writeback_us),m.digest,
-            m.collision_ready,contacts).unwrap();
+            m.collision_ready,contacts,spatial).unwrap();
     }
     fs::write(path,csv).map_err(|e|e.to_string())?;
     fs::write(path.with_extension("scene.ini"),config.encode()).map_err(|e|e.to_string())?;

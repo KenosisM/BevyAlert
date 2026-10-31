@@ -476,6 +476,7 @@ pub struct SimEnv {
     pub occupied: Vec<i32>,
     pub tick: u64,
     pub runtime: crate::simulation::Runtime,
+    pub buffers: crate::simulation::Buffers,
 
     // ---- 连续运动层（路线 C）------------------------------------------------
     /// true = 走 `update_sim_crowd`（互斥力 + 路权 + 压力场），false = 走旧的离散重力碗
@@ -496,6 +497,7 @@ impl Default for SimEnv {
             occupied: Vec::new(),
             tick: 0,
             runtime: crate::simulation::Runtime::default(),
+            buffers: crate::simulation::Buffers::default(),
             use_crowd: true,
             pressure: crowd::Pressure::default(),
             crowd_params: crowd::Params::default(),

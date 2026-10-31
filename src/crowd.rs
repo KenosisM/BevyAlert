@@ -199,6 +199,7 @@ fn norm(x: f32, y: f32) -> (f32, f32) {
 pub fn step_agent(
     i: usize,
     agents: &[Agent],
+    neighbors: &[usize],
     desired_dir: (f32, f32),
     goal: (f32, f32),
     pressure: &Pressure,
@@ -226,7 +227,8 @@ pub fn step_agent(
     let mut sy = 0.0;
     let mut touching = false;  // 有没有被人挤到（挤到时不让加速度限幅拖慢反应）
     let r = me.radius.max(0.05);
-    for (j, other) in agents.iter().enumerate() {
+    for &j in neighbors {
+        let other=&agents[j];
         if j == i {
             continue;
         }
@@ -303,7 +305,8 @@ pub fn step_agent(
     // 不加这条会和分离力「拔河」：一直往人堆里顶，最终稳态距离就落在半重叠上。
     // 这里按邻域里挤进来的人数压低期望速度，人少了自动恢复。
     let mut crowding = 0.0f32;
-    for (j, other) in agents.iter().enumerate() {
+    for &j in neighbors {
+        let other=&agents[j];
         if j == i || other.settled && me.settled {
             continue;
         }
@@ -343,11 +346,13 @@ pub fn step_agent(
 
 /// Compatibility entry for the legacy steering tests. Production also checks old->new
 /// pair trajectories with collision::finish_motion before any position is committed.
+#[cfg(test)]
 pub fn resolve_overlaps(agents: &mut [Agent], grid: &CostGrid, iterations: u32) {
     crate::collision::project_contacts(agents,grid,iterations);
 }
 
 /// Legacy steering helper using the same disc sweep as production.
+#[cfg(test)]
 pub fn resolve_position(
     grid: &CostGrid,
     from: (f32, f32),
@@ -423,7 +428,8 @@ mod tests {
             let snapshot = agents.clone();
             for i in 0..n {
                 let dir = norm(goal.0 - snapshot[i].x, goal.1 - snapshot[i].y);
-                let (vx, vy) = step_agent(i, &snapshot, dir, goal, &pressure, &params, dt);
+                let neighbors:Vec<_>=(0..snapshot.len()).collect(); // test-only brute-force reference
+                let (vx, vy) = step_agent(i, &snapshot, &neighbors, dir, goal, &pressure, &params, dt);
                 let from = (agents[i].x, agents[i].y);
                 let to = (from.0 + vx * dt, from.1 + vy * dt);
                 let (_nx, _ny) = resolve_position(&grid, from, to);
@@ -465,7 +471,8 @@ mod tests {
             let snapshot = agents.clone();
             for i in 0..n {
                 let dir = norm(goal.0 - snapshot[i].x, goal.1 - snapshot[i].y);
-                let (vx, vy) = step_agent(i, &snapshot, dir, goal, &pressure, &params, dt);
+                let neighbors:Vec<_>=(0..snapshot.len()).collect(); // test-only brute-force reference
+                let (vx, vy) = step_agent(i, &snapshot, &neighbors, dir, goal, &pressure, &params, dt);
                 let from = (agents[i].x, agents[i].y);
                 let to = (from.0 + vx * dt, from.1 + vy * dt);
                 let (nx, ny) = resolve_position(&grid, from, to);

@@ -1,6 +1,16 @@
 //! Conservative disc motion on the navigation grid. No cached copy of terrain geometry.
 use bevy::math::Vec2;
 use crate::{crowd::Agent, nav::{self, CostGrid}};
+use crate::spatial::{Aabb,Index};
+
+#[derive(Default,Debug)]
+pub struct Workspace {
+    pub projection_index:Index,pub trajectory_index:Index,
+    bounds:Vec<Aabb>,pairs:Vec<(usize,usize)>,neighbors:Vec<usize>,before_projection:Vec<Vec2>,
+}
+impl Workspace {
+    pub fn begin_tick(&mut self) {self.projection_index.begin_tick();self.trajectory_index.begin_tick();}
+}
 
 /// Contact gap used to avoid repeated floating-point hits; radii are never reduced.
 pub const CONTACT_GAP: f32 = 0.0001;
@@ -125,10 +135,21 @@ pub fn move_disc(g:&CostGrid,from:Vec2,to:Vec2,r:f32)->(Vec2,Blocked) {
 
 /// Constrained contact projection. Every correction starts at a saved legal position.
 /// A wall-blocked share is offered to the other body, then all pairs are revisited.
+#[cfg(test)]
 pub fn project_contacts(agents:&mut [Agent],g:&CostGrid,iterations:u32) {
+    project_contacts_with_workspace(agents,g,iterations,&mut Workspace::default());
+}
+
+fn project_contacts_with_workspace(agents:&mut [Agent],g:&CostGrid,iterations:u32,w:&mut Workspace) {
+    let max_radius=agents.iter().map(|a|a.radius).fold(0.0f32,f32::max);
+    w.bounds.clear();w.bounds.extend(agents.iter().map(|a|Aabb::point(pos(a))));w.projection_index.rebuild(&w.bounds);
     for _ in 0..iterations {
         let mut changed=false;
-        for i in 0..agents.len() {for j in i+1..agents.len() {
+        for i in 0..agents.len() {
+            w.projection_index.query_radius(pos(&agents[i]),agents[i].radius+max_radius+CONTACT_GAP,&mut w.neighbors);
+            let mut cursor=0;let mut after=i;
+            while cursor<w.neighbors.len() {
+            let j=w.neighbors[cursor];cursor+=1;if j<=after {continue;}after=j;
             let (pi,pj)=(pos(&agents[i]),pos(&agents[j]));let q=pj-pi;let dist=q.length();
             let overlap=agents[i].radius+agents[j].radius+CONTACT_GAP-dist;
             if overlap<=EPS {continue;}
@@ -145,6 +166,12 @@ pub fn project_contacts(agents:&mut [Agent],g:&CostGrid,iterations:u32) {
             let nj=move_disc(g,nj,nj+n*missing,agents[j].radius).0;
             changed |= ni.distance_squared(pi)+nj.distance_squared(pj)>EPS*EPS;
             set(&mut agents[i],ni);set(&mut agents[j],nj);
+            if ni!=pi {w.projection_index.update(i,Aabb::point(ni));}
+            if nj!=pj {w.projection_index.update(j,Aabb::point(nj));}
+            if ni!=pi {
+                w.projection_index.query_radius(ni,agents[i].radius+max_radius+CONTACT_GAP,&mut w.neighbors);
+                cursor=0;
+            }
         }}
         if !changed {break;}
     }
@@ -163,25 +190,36 @@ fn pair_toi(old:&[Agent],next:&[Agent],i:usize,j:usize)->Option<f32> {
 /// Complete the proposed tick before committing any position. All published trajectories
 /// are the straight segments old->new. Pair limits are iterated because slowing a leader
 /// can affect its followers. Rare unsatisfied constraints conservatively stop the tick.
+#[cfg(test)]
 pub fn finish_motion(old:&[Agent],next:&mut [Agent],g:&CostGrid)->ContactReport {
+    let mut report=ContactReport::default();
+    finish_motion_with_workspace(old,next,g,&mut Workspace::default(),&mut report);report
+}
+
+pub fn finish_motion_with_workspace(old:&[Agent],next:&mut [Agent],g:&CostGrid,w:&mut Workspace,report:&mut ContactReport) {
     assert_eq!(old.len(),next.len());
-    let mut report=ContactReport{reasons:vec![Blocked::None;next.len()],..Default::default()};
+    let mut reasons=std::mem::take(&mut report.reasons);reasons.clear();reasons.resize(next.len(),Blocked::None);
+    *report=ContactReport{reasons,..Default::default()};
     for i in 0..next.len() {
         let (p,reason)=move_disc(g,pos(&old[i]),pos(&next[i]),old[i].radius);
         set(&mut next[i],p);report.reasons[i]=reason;
     }
-    let before_projection:Vec<_>=next.iter().map(pos).collect();
-    project_contacts(next,g,8);
+    w.before_projection.clear();w.before_projection.extend(next.iter().map(pos));
+    project_contacts_with_workspace(next,g,8,w);
     for i in 0..next.len() {
-        if pos(&next[i]).distance_squared(before_projection[i])>EPS*EPS && report.reasons[i]==Blocked::None {
+        if pos(&next[i]).distance_squared(w.before_projection[i])>EPS*EPS && report.reasons[i]==Blocked::None {
             report.reasons[i]=Blocked::Contact;
         }
         if disc_clear(g,pos(&old[i]),old[i].radius) {let p=clip(g,pos(&old[i]),pos(&next[i]),old[i].radius);set(&mut next[i],p);}
     }
+    // Subsequent trajectory limits only shrink these boxes, so this pair superset
+    // remains conservative for every CCD iteration and the final error measurement.
+    w.bounds.clear();w.bounds.extend(old.iter().zip(next.iter()).map(|(a,b)|Aabb::swept(pos(a),pos(b),a.radius+CONTACT_GAP)));
+    w.trajectory_index.rebuild(&w.bounds);w.trajectory_index.pairs(&mut w.pairs);
     let mut safe=false;
     for _ in 0..32 {
         let mut limited=false;
-        for i in 0..next.len() {for j in i+1..next.len() {
+        for &(i,j) in &w.pairs {
             if let Some(t)=pair_toi(old,next,i,j) {
                 let di=pos(&next[i])-pos(&old[i]);let dj=pos(&next[j])-pos(&old[j]);
                 let scale=(t-CONTACT_GAP/(di-dj).length().max(CONTACT_GAP)).max(0.0);
@@ -189,13 +227,13 @@ pub fn finish_motion(old:&[Agent],next:&mut [Agent],g:&CostGrid)->ContactReport 
                 report.reasons[i]=Blocked::Contact;report.reasons[j]=Blocked::Contact;
                 report.limited_trajectories+=1;limited=true;
             }
-        }}
+        }
         if !limited {safe=true;break;}
     }
     if !safe {
         for i in 0..next.len() {set(&mut next[i],pos(&old[i]));report.reasons[i]=Blocked::SafetyStop;}
     }
-    for i in 0..next.len() {for j in i+1..next.len() {
+    for &(i,j) in &w.pairs {
         let q=pos(&old[j])-pos(&old[i]);let r=old[i].radius+old[j].radius;
         if q.length()+EPS<r {report.initial_overlaps+=1;}
         else {
@@ -209,14 +247,13 @@ pub fn finish_motion(old:&[Agent],next:&mut [Agent],g:&CostGrid)->ContactReport 
             report.unresolved_pairs+=1;
             report.reasons[i]=Blocked::SafetyStop;report.reasons[j]=Blocked::SafetyStop;
         }
-    }}
+    }
     for i in 0..next.len() {
         let (a,b,r)=(pos(&old[i]),pos(&next[i]),old[i].radius);
         if !disc_clear(g,a,r) || !disc_clear(g,b,r)
             || !nav::segment_allowed(g,(a.x,a.y),(b.x,b.y))
             || first_hit(g,a,b-a,r).is_some_and(|h|h.t<1.0-EPS) {report.illegal_static_trajectories+=1;}
     }
-    report
 }
 
 #[cfg(test)]
