@@ -10,16 +10,17 @@ pub const HEIGHT: i32 = 160;
 pub const TICK_HZ: f64 = 60.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SceneKind { Crossing, HeadOn, Single }
+pub enum SceneKind { Crossing, HeadOn, Single, SingleObstacle, SingleWidth }
 
 impl SceneKind {
     pub fn name(self) -> &'static str {
-        match self { Self::Crossing => "crossing", Self::HeadOn => "head-on", Self::Single => "single" }
+        match self { Self::Crossing => "crossing", Self::HeadOn => "head-on", Self::Single => "single",Self::SingleObstacle=>"single-obstacle",Self::SingleWidth=>"single-width" }
     }
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "crossing" => Ok(Self::Crossing), "head-on" => Ok(Self::HeadOn),
-            "single" => Ok(Self::Single), _ => Err("scene must be crossing, head-on or single".into()),
+            "single" => Ok(Self::Single),"single-obstacle"=>Ok(Self::SingleObstacle),"single-width"=>Ok(Self::SingleWidth),
+            _ => Err("unknown navigation scene".into()),
         }
     }
     /// All routes receive their orders at tick zero, before either runner advances.
@@ -29,7 +30,7 @@ impl SceneKind {
         match self {
             Self::Crossing => vec![(a,d), (b,c), (c,b), (d,a)],
             Self::HeadOn => vec![(Cell::new(32,80),Cell::new(160,80)), (Cell::new(160,80),Cell::new(32,80))],
-            Self::Single => vec![(Cell::new(32,80),Cell::new(160,80))],
+            Self::Single|Self::SingleObstacle|Self::SingleWidth => vec![(Cell::new(32,80),Cell::new(160,80))],
         }
     }
 }
@@ -110,12 +111,13 @@ pub struct RunOptions {
     pub exit_after_ticks: Option<u64>,
     pub capture: Option<PathBuf>,
     pub exit_after_frames: Option<u64>,
+    pub stop_after_parked:Option<u64>,
 }
 
 pub fn parse_args(args: &[String]) -> Result<(SceneConfig,RunOptions),String> {
     let mut config = SceneConfig::default();
     for pair in args.windows(2) { if pair[0]=="--config" { config=SceneConfig::load(Path::new(&pair[1]))?; } }
-    let mut run = RunOptions { headless:false,ticks:3600,csv:None,paused:false,exit_after_ticks:None,capture:None,exit_after_frames:None };
+    let mut run = RunOptions { headless:false,ticks:3600,csv:None,paused:false,exit_after_ticks:None,capture:None,exit_after_frames:None,stop_after_parked:None };
     let mut i=0;
     while i<args.len() {
         let option=&args[i];
@@ -134,6 +136,8 @@ pub fn parse_args(args: &[String]) -> Result<(SceneConfig,RunOptions),String> {
             "--exit-after-ticks"=>run.exit_after_ticks=Some(value.parse().map_err(|_|"invalid exit tick")?),
             "--capture"=>run.capture=Some(PathBuf::from(value)),
             "--exit-after-frames"=>run.exit_after_frames=Some(value.parse().map_err(|_|"invalid exit frame")?),
+            "--stop-after-parked"=>{let n=value.parse().map_err(|_|"invalid parking observation")?;
+                if n<180 {return Err("parking observation must cover at least180 ticks".into());}run.stop_after_parked=Some(n);}
             _=>return Err(format!("unknown option: {option}")),
         }
         i+=2;
@@ -149,8 +153,12 @@ pub fn populate(world: &mut World, config: &SceneConfig) -> Result<(),String> {
     let mut runtime=Runtime::from_hz(TICK_HZ,config.seed);
     runtime.sample_every=config.sample_every;
     let step=runtime.fixed_step();
+    let mut grid=CostGrid{w:WIDTH,h:HEIGHT,cost:vec![1;(WIDTH*HEIGHT) as usize],..default()};
+    if config.kind==SceneKind::SingleObstacle {for y in 54..=106 {for x in 92..=98 {grid.cost[(y*WIDTH+x) as usize]=0;}}}
+    if config.kind==SceneKind::SingleWidth {for y in 0..HEIGHT {if (75..=85).contains(&y) {continue;}
+        for x in 78..=112 {grid.cost[(y*WIDTH+x) as usize]=0;}}}
     world.insert_resource(SimEnv {
-        nav:CostGrid { w:WIDTH,h:HEIGHT,cost:vec![1;(WIDTH*HEIGHT) as usize],..default() },
+        nav:grid,
         ground:GroundField { w:WIDTH,h:HEIGHT,level:vec![0;(WIDTH*HEIGHT) as usize],..default() },
         use_crowd:config.continuous,runtime,..default()
     });
@@ -199,14 +207,15 @@ pub struct Metrics {
     pub reserved:usize,pub frozen_targets:usize,pub waiting_space:usize,pub waiting_entrance:usize,pub blocked_near:usize,
     pub planning_us:u128,pub formation_us:u128,
     pub entry_refinements:u64,
-    pub arrived:Option<usize>,pub arriving:usize,pub waiting:[usize;4],pub replanning:usize,pub failed:usize,pub max_parked_drift:f32,
+    pub arrived:Option<usize>,pub arriving:usize,pub waiting:[usize;5],pub replanning:usize,pub failed:usize,pub max_parked_drift:f32,
     pub orca:crate::crowd::OrcaReport,
     pub traffic:crate::traffic::Report,pub traffic_us:u128,
+    pub recovery:crate::recovery::Report,pub recovery_us:u128,
 }
 impl Metrics {
     pub fn arrival_text(&self)->String {self.arrived.map_or("not-ready".into(),|v|v.to_string())}
     pub fn waiting_text(&self)->String {if self.arrived.is_none(){return "not-ready".into();}
-        format!("stopped:{}|space:{}|entrance:{}|path:{}|replan:{}|traffic:{}",self.waiting[0],self.waiting[1],self.waiting[2],self.waiting[3],self.replanning,self.traffic.waiting)}
+        format!("stopped:{}|space:{}|entrance:{}|path:{}|replan:{}|traffic:{}|search:{}|no-route:{}|budget:{}|blocked:{}",self.waiting[0],self.waiting[1],self.waiting[2],self.waiting[3],self.replanning,self.traffic.waiting,self.recovery.queued+self.recovery.searching,self.recovery.no_route,self.waiting[4],self.recovery.blocked)}
 }
 
 pub fn metrics(world:&mut World) -> Metrics {
@@ -217,6 +226,7 @@ pub fn metrics(world:&mut World) -> Metrics {
     m.spatial=env.runtime.spatial_stats.clone();
     m.orca=env.runtime.orca.clone();
     m.traffic=env.traffic.report.clone();
+    m.recovery=env.recovery.report.clone();
     m.reserved=env.reservations.claims.len();m.planning_us=env.reservations.planning_time.as_micros();
     m.entry_refinements=env.reservations.entry_refinements;
     m.collision_ready=env.use_crowd&&env.tick>0;
@@ -249,6 +259,7 @@ pub fn metrics(world:&mut World) -> Metrics {
             digest=(digest^v).wrapping_mul(0x100000001b3);
         }
         digest=(digest^u.traffic_phase as u64).wrapping_mul(0x100000001b3);
+        digest=(digest^u.recovery_phase as u64).wrapping_mul(0x100000001b3);
         if !m.collision_ready {for other in &units[i+1..] {
             m.overlap_end=m.overlap_end.max((env.crowd_params.radius_default()*2.0-(u.cell_x-other.cell_x).hypot(u.cell_y-other.cell_y)).max(0.0));
         }}
@@ -262,6 +273,7 @@ pub fn metrics(world:&mut World) -> Metrics {
         m.velocity_us=t.velocity.as_micros();m.contact_us=t.contact.as_micros();m.writeback_us=t.writeback.as_micros();
         m.formation_us=t.formation.as_micros();
         m.traffic_us=t.traffic.as_micros();
+        m.recovery_us=t.recovery.as_micros();
     }
     m
 }
@@ -271,6 +283,7 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
     if let Some(parent)=path.parent().filter(|p|!p.as_os_str().is_empty()) { fs::create_dir_all(parent).map_err(|e|e.to_string())?; }
     let mut csv=String::from("tick,seconds,active,moving,arrived,waiting_reason,legacy_stalled,max_still_seconds,overlap_end,bad_centers,core_us,snapshot_us,pressure_us,velocity_us,contact_us,writeback_us,digest,collision_ready,swept_penetration,unresolved_contacts,illegal_trajectories,limited_trajectories,initial_overlaps,safety_stops,spatial_us,neighbor_peak,bucket_peak,neighbor_queries,neighbor_entries,pair_candidates,neighbor_truncated,dense_bucket_events,large_bounds,fallback_queries,reservation_count,frozen_targets,waiting_space,waiting_entrance,blocked_near_path,command_plan_us,formation_us,entry_refinements,arriving,stopped,replanning,failed,max_parked_drift,orca_solved,orca_infeasible,orca_invalid,orca_emergency,orca_static_constraints,orca_unit_constraints,orca_full_responsibility,orca_neighbor_truncated,orca_contact_fallback,orca_max_violation\n");
     csv.pop();csv.push_str(",traffic_us,traffic_passing,traffic_waiting,traffic_admitted,traffic_gates,traffic_batches,traffic_switches,traffic_max_wait,traffic_incompatible,traffic_unavailable\n");
+    csv.pop();csv.push_str(",recovery_us,recovery_diagnosed,recovery_yielding,recovery_queued,recovery_searching,recovery_following,recovery_no_route,recovery_waiting_space,recovery_scheduled_wait,recovery_expanded,recovery_budget_pending,recovery_max_no_progress,recovery_max_queue_age,recovery_stale_results,recovery_replans,recovery_motion_blocked,waiting_search_budget\n");
     for m in samples {
         let timing=|v:u128|if m.timing_ready {v.to_string()} else {"not-ready".into()};
         let contacts=if m.collision_ready {format!("{:.6},{},{},{},{},{}",m.swept_penetration,
@@ -285,6 +298,7 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
         let arrival=format!("{},{},{},{},{:.9},{},{},{},{},{},{},{},{},{},{:.9}",m.arriving,m.waiting[0],m.replanning,m.failed,m.max_parked_drift,
             o.solved,o.infeasible,o.invalid,o.emergency,o.static_constraints,o.unit_constraints,o.full_responsibility,o.truncated,o.contact_fallback,o.max_violation);
         let t=&m.traffic;let arrival=format!("{arrival},{},{},{},{},{},{},{},{:.6},{},{}",timing(m.traffic_us),t.passing,t.waiting,t.admitted,t.gates,t.batches,t.switches,t.max_wait,t.incompatible,t.unavailable);
+        let r=&m.recovery;let arrival=format!("{arrival},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{},{},{},{}",timing(m.recovery_us),r.diagnosed,r.yielding,r.queued,r.searching,r.following,r.no_route,r.waiting_space,r.scheduled_wait,r.expanded,r.budget_pending,r.max_no_progress,r.max_queue_age,r.stale_results,r.replans,r.blocked,m.waiting[4]);
         writeln!(csv,"{},{:.6},{},{},{},{},{},{:.6},{:.6},{},{},{},{},{},{},{},{:016x},{},{},{},{},{}",
             m.tick,m.tick as f64/TICK_HZ,m.active,m.moved,m.arrival_text(),m.waiting_text(),m.legacy_stalled,m.max_still_seconds,m.overlap_end,
             m.bad_centers,timing(m.total_us),timing(m.snapshot_us),timing(m.pressure_us),timing(m.velocity_us),timing(m.contact_us),timing(m.writeback_us),m.digest,
@@ -294,16 +308,28 @@ pub fn write_report(world:&mut World,config:&SceneConfig,samples:&[Metrics],path
     fs::write(path.with_extension("scene.ini"),config.encode()).map_err(|e|e.to_string())?;
     let mut units:Vec<_>=world.query::<&Unit>().iter(world).cloned().collect();units.sort_by_key(|u|u.idx);
     let mut snapshot=String::from("id,group,command,x,y,vx,vy,goal_x,goal_y,still_ticks,stall_ticks,parking_x,parking_y,parking_valid,parking_frozen,target_block,motion,command_status,quiet_seconds,parked_drift\n");
-    snapshot.pop();snapshot.push_str(",traffic_phase\n");
+    snapshot.pop();snapshot.push_str(",traffic_phase,recovery_phase,no_progress_seconds,requested_vx,requested_vy,requested_cap,preferred_vx,preferred_vy,traffic_x,traffic_y,traffic_cap,assembly_x,assembly_y,assembly_block,recovery_x,recovery_y,contact_hold,traffic_hold\n");
+    let env=world.resource::<SimEnv>();
     for u in units {
         let parking=u.parking.as_ref().map_or("none,none,false,false,none".into(),|t|format!("{:.9},{:.9},{},{},{:?}",t.position.x,t.position.y,t.valid,t.frozen,t.blocked));
-        writeln!(snapshot,"{},{},{},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{},{:?},{:?},{:.9},{:.9},{:?}",u.idx,
+        let vector=|p:Option<Vec2>|p.map_or("none,none".into(),|p|format!("{:.9},{:.9}",p.x,p.y));
+        let (requested,cap)=env.buffers.requested_motion(u.idx).map_or(("none,none".into(),"none".into()),|(v,c)|(vector(Some(v)),format!("{c:.9}")));
+        let decision=env.traffic.decision(u.idx);
+        let assembly=env.traffic.assembly_target(u.idx,u.command_id.map_or(0,|c|c.0));
+        let diagnostics=format!("{},{},{},{},{},{},{},{},{},{}",requested,cap,vector(u.preferred_velocity),
+            vector(decision.point),decision.cap.map_or("none".into(),|c|format!("{c:.9}")),
+            vector(assembly.map(|t|t.position)),assembly.map_or("none".into(),|t|format!("{:?}",t.blocked)),
+            vector(env.recovery.task_goal(u.idx)),u.contact_hold,u.traffic_hold);
+        writeln!(snapshot,"{},{},{},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{},{:?},{:?},{:.9},{:.9},{:?},{:?},{:.6},{}",u.idx,
         u.idx as usize/config.per_group,u.command_id.map_or(0,|c|c.0),u.cell_x,u.cell_y,u.vx,u.vy,
-        u.goal.x,u.goal.y,u.still_ticks,u.stall_ticks,parking,u.arrival.motion,crate::arrival::status(&u),u.arrival.quiet_seconds,u.arrival.max_drift,u.traffic_phase).unwrap(); }
+        u.goal.x,u.goal.y,u.still_ticks,u.stall_ticks,parking,u.arrival.motion,crate::arrival::status(&u),u.arrival.quiet_seconds,u.arrival.max_drift,u.traffic_phase,u.recovery_phase,u.no_progress_seconds,diagnostics).unwrap(); }
     fs::write(path.with_extension("units.csv"),snapshot).map_err(|e|e.to_string())?;
     let mut events=String::from("tick,region,command,unit,event,side\n");
     for e in &world.resource::<SimEnv>().traffic.events {writeln!(events,"{},{},{},{},{},{}",e.tick,e.region,e.command,e.unit,e.kind,e.side).unwrap();}
     fs::write(path.with_extension("traffic.csv"),events).map_err(|e|e.to_string())?;
+    let mut events=String::from("tick,unit,command,event\n");
+    for e in &world.resource::<SimEnv>().recovery.events {writeln!(events,"{},{},{},{}",e.tick,e.unit,e.command,e.kind).unwrap();}
+    fs::write(path.with_extension("recovery.csv"),events).map_err(|e|e.to_string())?;
     Ok(())
 }
 
@@ -313,14 +339,18 @@ pub fn headless(config:&SceneConfig,run:&RunOptions) -> Result<(),String> {
     let start=Instant::now();
     println!("scene={} mode={} groups={} per_group={} seed={} jitter={} hz={TICK_HZ} arrival={} waiting={}",
         config.kind.name(),config.mode(),config.kind.routes().len(),config.per_group,config.seed,config.jitter,samples[0].arrival_text(),samples[0].waiting_text());
+    let mut parked_since=None;
     for _ in 0..run.ticks {
         schedule.run(&mut world);
         let tick=world.resource::<SimEnv>().tick;
-        if tick%config.sample_every==0 || tick==run.ticks {
+        if all_parked(&mut world) {parked_since.get_or_insert(tick);}else{parked_since=None;}
+        let parked_end=run.stop_after_parked.is_some_and(|hold|parked_since.is_some_and(|since|tick-since>=hold));
+        if tick%config.sample_every==0 || tick==run.ticks||parked_end {
             let m=metrics(&mut world);
             println!("tick={} moving={} legacy_stalled={} overlap_end={:.4} arrived={} digest={:016x}",m.tick,m.moved,m.legacy_stalled,m.overlap_end,m.arrival_text(),m.digest);
             samples.push(m);
         }
+        if parked_end {break;}
     }
     if let Some(path)=&run.csv { write_report(&mut world,config,&samples,path)?; }
     let completed=world.resource::<SimEnv>().tick;let arrived=metrics(&mut world).arrival_text();
@@ -328,12 +358,16 @@ pub fn headless(config:&SceneConfig,run:&RunOptions) -> Result<(),String> {
     Ok(())
 }
 
+pub fn all_parked(world:&mut World)->bool {
+    let mut any=false;for u in world.query::<&Unit>().iter(world) {any=true;if !u.arrival.settled() {return false;}}any
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn configuration_roundtrips_and_rejects_changed_acceptance_geometry() {
-        for kind in [SceneKind::Crossing,SceneKind::HeadOn,SceneKind::Single] {
+        for kind in [SceneKind::Crossing,SceneKind::HeadOn,SceneKind::Single,SceneKind::SingleObstacle,SceneKind::SingleWidth] {
             let c=SceneConfig {kind,seed:42,jitter:0.02,..default()};
             assert_eq!(SceneConfig::decode(&c.encode()).unwrap(),c);
             assert!(SceneConfig::decode(&c.encode().replace("TickHz=60","TickHz=30")).is_err());

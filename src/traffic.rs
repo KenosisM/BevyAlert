@@ -2,10 +2,10 @@
 //! Decisions change preferred routes and admission, never positions or ORCA outputs.
 use std::collections::{BTreeMap,BTreeSet};
 use bevy::math::Vec2;
-use crate::{collision,formation,nav::CostGrid,orca::HalfPlane,world::Unit};
+use crate::{collision,formation,nav::{self,Cell,CostGrid,PathSearch,SearchStatus},orca::HalfPlane,world::Unit};
 
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
-pub enum Phase {#[default] Free,Passing,Assembling,FinalApproach,Queueing,Admitted,Traversing,ExitClearing,ExitBlocked}
+pub enum Phase {#[default] Free,Passing,Assembling,GivingWay,FinalApproach,Queueing,Admitted,Traversing,ExitClearing,ExitBlocked}
 #[derive(Clone,Copy,Debug,Default)]
 pub struct Decision {pub point:Option<Vec2>,pub cap:Option<f32>,pub barrier:Option<HalfPlane>,pub phase:Phase,pub freeze_target:bool}
 #[derive(Clone,Debug)]
@@ -14,25 +14,94 @@ pub struct Event {pub tick:u64,pub region:usize,pub command:u64,pub unit:i32,pub
 pub struct Report {pub passing:usize,pub waiting:usize,pub admitted:usize,pub gates:usize,
     pub batches:u64,pub switches:u64,pub max_wait:f64,pub incompatible:usize,pub unavailable:usize}
 struct Origin {start:Vec2,goal:Vec2,radius:f32,area:f32,offsets:BTreeMap<i32,Vec2>}
-struct Route {points:Vec<Vec2>,cursor:usize,region:usize}
-struct Deployment {targets:BTreeMap<i32,formation::Target>,advancing:bool,region:usize}
+struct Route {points:Vec<Vec2>,cursor:usize,region:usize,staging:Option<Deployment>}
+struct Deployment {targets:BTreeMap<i32,formation::Target>,source:BTreeMap<i32,Vec2>,advancing:bool,region:usize,progress:f32,progress_mark:f32,last_progress_tick:u64,guide:Option<std::sync::Arc<crate::nav::FlowField>>}
+fn deployment_matches(d:&Deployment,group:&[&Unit])->bool {
+    d.source.len()==group.len()&&group.iter().all(|u|u.parking.as_ref().is_some_and(|t|t.valid&&d.source.get(&u.idx)==Some(&t.position)))
+}
+struct TerrainJob {radius:f32,goal:Vec2,search:PathSearch,staging:Deployment}
+struct StagingYield {command:u64,requester:i32,requested_since:u64,original:Vec2,pocket:Vec2,anchor:Vec2,victims:Vec<i32>,since:u64,returning:bool,region:usize,target:formation::Target}
 #[derive(Default)]
 pub struct Traffic {
     origins:BTreeMap<u64,Origin>,routes:BTreeMap<u64,Route>,encountered:BTreeSet<(u64,u64)>,
     deployments:BTreeMap<u64,Deployment>,
+    deployed:BTreeSet<u64>,
+    terrain_jobs:BTreeMap<u64,TerrainJob>,terrain_attempted:BTreeSet<u64>,
+    staging_yields:BTreeMap<i32,StagingYield>,review_requests:BTreeMap<(u64,i32),u64>,review_after:BTreeMap<(u64,i32),u64>,
     pub decisions:BTreeMap<i32,Decision>,pub events:Vec<Event>,pub report:Report,
     signature:Vec<u8>,width:i32,height:i32,gates:Vec<Gate>,next_region:usize,
 }
 impl Traffic {
     pub fn decision(&self,id:i32)->Decision {self.decisions.get(&id).copied().unwrap_or_default()}
+    pub fn coordination_has_progress(&self,command:u64,tick:u64,dt:f32)->bool {
+        self.deployments.get(&command).is_some_and(|d|d.advancing
+            &&tick.saturating_sub(d.last_progress_tick)<(1.0/dt).ceil().max(1.0) as u64)
+    }
+    pub fn request_review(&mut self,id:i32,command:u64,tick:u64) {
+        self.review_requests.entry((command,id)).or_insert(tick);
+        if !self.routes.contains_key(&command)&&!self.deployments.contains_key(&command) {
+            self.encountered.retain(|(a,b)|*a!=command&&*b!=command);
+        }
+        for (region,gate) in self.gates.iter_mut().enumerate() {
+            if let Some(waiter)=gate.waiters.get(&id).filter(|w|w.command==command) {
+                let side=waiter.side;
+                if gate.tokens.get(&id).is_some_and(|t|!t.started&&!t.entered) {gate.tokens.remove(&id);}
+                self.events.push(Event{tick,region,command,unit:id,kind:"readmission-review",side});
+            }
+        }
+        self.events.push(Event{tick,region:0,command,unit:id,kind:"route-review",side:0});
+    }
+    pub fn assembly_pending(&self,id:i32,command:u64)->bool {
+        if let Some(t)=self.staging_yields.get(&id).filter(|t|t.command==command) {return t.target.blocked==Some(formation::TargetBlock::SearchBudget);}
+        self.deployments.get(&command).filter(|d|!d.advancing).and_then(|d|d.targets.get(&id))
+            .is_some_and(|t|t.blocked==Some(formation::TargetBlock::SearchBudget))
+    }
+    pub fn assembly_guide(&self,command:u64)->Option<&crate::nav::FlowField> {
+        self.deployments.get(&command).filter(|d|!d.advancing)?.guide.as_deref()
+    }
+    pub fn assembly_target(&self,id:i32,command:u64)->Option<&formation::Target> {
+        if let Some(t)=self.staging_yields.get(&id).filter(|t|t.command==command) {return Some(&t.target);}
+        self.deployments.get(&command)?.targets.get(&id)
+    }
+    pub fn progress_metric(&self,id:i32,command:u64,here:Vec2,goal:Vec2,g:&CostGrid)->Option<(f32,u8)> {
+        if let Some(route)=self.routes.get(&command) {let origin=self.origins.get(&command)?;let offset=*origin.offsets.get(&id)?;
+            let point=*route.points.get(route.cursor)?+offset;
+            return Some((here.distance(point)+route.points[route.cursor..].windows(2).map(|p|p[0].distance(p[1])).sum::<f32>(),2));
+        }
+        if self.terrain_jobs.contains_key(&command) {return Some((here.distance(goal),7));}
+        let d=self.deployments.get(&command)?;if d.advancing {return Some((here.distance(goal),4));}
+        let target=d.targets.get(&id)?;let center=Vec2::new(target.center.x as f32,target.center.y as f32);
+        if let Some(field)=&d.guide {if here.distance(center)>target.area_radius+formation::LOCAL_APPROACH_MARGIN
+            ||!collision::disc_segment_clear(g,here,target.position,target.radius) {
+            let cell=crate::nav::Cell::new(here.x.round() as i32,here.y.round() as i32);
+            if crate::nav::flow_step(g,field,cell).is_some() {let distance=field.dist_at(cell.x,cell.y);if distance.is_finite() {return Some((distance,5));}}
+        }}
+        let remaining=target.remaining_distance(here,target.position);
+        Some((if remaining.is_finite() {remaining}else{here.distance(target.position)},3))
+    }
     pub fn assembly_direction(&mut self,id:i32,command:u64,here:Vec2,tick:u64,q:&mut crate::local_nav::Query<'_>,routes:&mut crate::local_nav::Routes)->Option<Vec2> {
+        if self.decision(id).phase==Phase::GivingWay {
+            let task=self.staging_yields.get_mut(&id).filter(|t|t.command==command)?;
+            let goal=if task.returning {task.original}else{task.pocket};
+            return Some(task.target.local_direction(here,goal,command,tick,q,routes));
+        }
         if self.decision(id).phase!=Phase::Assembling {return None;}
         let deployment=self.deployments.get_mut(&command)?;
         if deployment.advancing {return None;}
         let target=deployment.targets.get_mut(&id)?;
+        let center=Vec2::new(target.center.x as f32,target.center.y as f32);
+        if let Some(field)=&deployment.guide {
+            let blocked=!collision::disc_segment_clear(q.grid,here,target.position,target.radius);
+            if blocked||(here.distance(center)>target.area_radius+formation::LOCAL_APPROACH_MARGIN&&!q.clear(here,target.position,true)) {
+                let cell=crate::nav::Cell::new(here.x.round() as i32,here.y.round() as i32);
+                if let Some(next)=crate::nav::flow_step(q.grid,field,cell) {let v=(Vec2::new(next.x as f32,next.y as f32)-Vec2::new(cell.x as f32,cell.y as f32)).normalize_or_zero();
+                    if q.clear(here,here+v,true) {target.blocked=None;return Some(v);}
+                }
+            }
+        }
         Some(target.local_direction(here,target.position,command,tick,q,routes))
     }
-    pub fn update(&mut self,g:&CostGrid,units:&[Unit],tick:u64,dt:f32) {
+    pub fn update(&mut self,g:&CostGrid,units:&[Unit],tick:u64,dt:f32,budget:&mut nav::ReplanBudget) {
         self.decisions.clear();self.report.passing=0;self.report.waiting=0;self.report.admitted=0;
         self.report.incompatible=0;self.report.unavailable=0;
         self.refresh(g);
@@ -40,6 +109,8 @@ impl Traffic {
         for u in units {if u.on_ground&&u.parking.is_some() {if let Some(id)=u.command_id {groups.entry(id.0).or_default().push(u);}}}
         self.origins.retain(|id,_|groups.contains_key(id));self.routes.retain(|id,_|groups.contains_key(id));
         self.deployments.retain(|id,_|groups.contains_key(id));
+        self.terrain_jobs.retain(|id,_|groups.contains_key(id));self.terrain_attempted.retain(|id|groups.contains_key(id));
+        self.deployed.retain(|id|groups.contains_key(id));
         self.encountered.retain(|(a,b)|groups.contains_key(a)&&groups.contains_key(b));
         let mut centres=BTreeMap::new();
         for (&id,group) in &groups {
@@ -51,6 +122,18 @@ impl Traffic {
                     radius:group.iter().map(|u|formation::position(u).distance(centre)+u.parking.as_ref().unwrap().radius).fold(0.0,f32::max),
                     offsets:group.iter().map(|u|(u.idx,formation::position(u)-centre)).collect()}
             });
+        }
+        let mut stale=BTreeSet::new();
+        self.terrain_jobs.retain(|id,j|{let valid=deployment_matches(&j.staging,&groups[id]);if !valid {stale.insert(*id);}valid});
+        self.routes.retain(|id,r|{let valid=r.staging.as_ref().is_none_or(|d|deployment_matches(d,&groups[id]));if !valid {stale.insert(*id);}valid});
+        for id in stale {self.terrain_attempted.remove(&id);self.deployed.remove(&id);
+            self.events.push(Event{tick,region:0,command:id,unit:-1,kind:"terrain-stale",side:0});}
+        let mut review=BTreeSet::new();
+        self.deployments.retain(|id,d|{let valid=deployment_matches(d,&groups[id]);if !valid {review.insert(*id);}valid});
+        for id in review {
+            // A repaired member resumes individual parking; settled peers keep
+            // their real positions rather than re-entering a temporary layout.
+            self.deployed.insert(id);self.events.push(Event{tick,region:0,command:id,unit:-1,kind:"deployment-review",side:0});
         }
         // Group intersections form local encounter regions. Route geometry and side
         // are frozen for the encounter; no frame-dependent force or start delay.
@@ -83,10 +166,11 @@ impl Traffic {
             }).collect();
             if plans.len()!=members.len() {self.report.unavailable+=1;continue;}
             for (id,points) in plans {if self.routes.contains_key(&id) {continue;}
-                self.routes.insert(id,Route{points,cursor:0,region});
+                self.routes.insert(id,Route{points,cursor:0,region,staging:None});
                 self.events.push(Event{tick,region,command:id,unit:-1,kind:"right-route",side:1});
             }
         }
+        self.terrain_detours(g,&groups,&centres,tick,budget);
         let mut done=Vec::new();
         for (&id,route) in &mut self.routes {
             let centre=centres[&id];let origin=&self.origins[&id];
@@ -97,38 +181,51 @@ impl Traffic {
             }
             if route.cursor==route.points.len() {done.push(id);continue;}
             let point=route.points[route.cursor];
-            for u in &groups[&id] {if u.arrival.held()||u.parking.as_ref().is_some_and(|t|t.local_active) {continue;}
+            for u in &groups[&id] {if u.arrival.held()||(route.staging.is_none()&&u.parking.as_ref().is_some_and(|t|t.local_active)) {continue;}
                 self.decisions.insert(u.idx,Decision{point:Some(point+origin.offsets[&u.idx]),phase:Phase::Passing,..Default::default()});self.report.passing+=1;
             }
         }
         for id in done {let route=self.routes.remove(&id).unwrap();self.events.push(Event{tick,region:route.region,command:id,unit:-1,kind:"route-cleared",side:1});
-            let o=&self.origins[&id];let direction=o.goal-o.start;
-            let axis=if direction.x.abs()>=direction.y.abs() {Vec2::X*direction.x.signum()}else{Vec2::Y*direction.y.signum()};
-            // Temporary lanes must admit a disc between already aligned owners.
-            // Final reservations keep their original spacing and positions.
-            let shift=axis*(3.0*o.area+formation::LOCAL_APPROACH_MARGIN+2.0);
-            let center=o.goal-shift;let cell=crate::nav::Cell::new(center.x.round() as i32,center.y.round() as i32);
-            let mut targets=BTreeMap::new();
-            for u in &groups[&id] {let mut t=u.parking.as_ref().unwrap().clone();t.position=center+(t.position-o.goal)*2.0;t.area_radius*=2.0;
-                t.phase=t.phase*2.0+(center-Vec2::new(cell.x as f32,cell.y as f32))/formation::PARKING_SPACING;
-                t.center=cell;t.predecessor=None;t.frozen=true;t.local_active=true;t.blocked=None;
-                targets.insert(u.idx,t);
-            }
-            if targets.values().all(|t|collision::disc_clear(g,t.position,t.radius)) {
-                self.deployments.insert(id,Deployment{targets,advancing:false,region:route.region});
+            if let Some(deployment)=route.staging.or_else(||deployment(g,&self.origins[&id],&groups[&id],route.region)) {
+                self.deployments.insert(id,deployment);self.deployed.insert(id);
                 self.events.push(Event{tick,region:route.region,command:id,unit:-1,kind:"deployment-start",side:1});
             }
+        }
+        // Large commands also need an orderly expansion after a single march.
+        // This is an immediate route decision; it never delays issuing the order.
+        for (&id,group) in &groups {if group.len()<64||self.routes.contains_key(&id)||self.terrain_jobs.contains_key(&id)||self.deployed.contains(&id)||group.iter().all(|u|u.arrival.settled()) {continue;}
+            let region=self.next_region;self.next_region+=1;self.deployed.insert(id);
+            if let Some(d)=deployment(g,&self.origins[&id],group,region) {self.deployments.insert(id,d);
+                self.events.push(Event{tick,region,command:id,unit:-1,kind:"deployment-start",side:1});
+            }else{self.report.unavailable+=1;}
         }
         let mut deployed=Vec::new();
         for (&id,d) in &mut self.deployments {
             let group=&groups[&id];
             if group.iter().all(|u|u.arrival.settled()) {deployed.push(id);continue;}
             if !d.advancing&&group.iter().all(|u|formation::position(u).distance(d.targets[&u.idx].position)<=0.06&&u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED) {
-                d.advancing=true;self.events.push(Event{tick,region:d.region,command:id,unit:-1,kind:"deployment-ready",side:1});
+                d.advancing=true;d.progress_mark=d.progress;d.last_progress_tick=tick;
+                self.events.push(Event{tick,region:d.region,command:id,unit:-1,kind:"deployment-ready",side:1});
             }
+            let mut max_length=0.0f32;let mut actual=1.0f32;let mut speed_rate=f32::INFINITY;let mut brake_rate=f32::INFINITY;let mut remaining=0.0f32;
+            if d.advancing {for u in group {let start=d.targets[&u.idx].position;let goal=u.parking.as_ref().unwrap().position;let path=goal-start;let length=path.length();
+                max_length=max_length.max(length);if length>1e-5 {actual=actual.min(((formation::position(u)-start).dot(path)/path.length_squared()).clamp(0.0,1.0));
+                    speed_rate=speed_rate.min(u.speed/length);brake_rate=brake_rate.min(u.speed*6.0/length);
+                    remaining=remaining.max(formation::position(u).distance(goal)/length);}
+            }d.progress=d.progress.max(actual);
+                // Renew only after measured common displacement. A moving
+                // reference, elapsed time or small oscillations cannot renew it.
+                if (d.progress-d.progress_mark)*max_length>=0.2 {d.progress_mark=d.progress;d.last_progress_tick=tick;}
+            }
+            let (progress,rate)=if d.advancing&&max_length>1e-5 {
+                let point=(d.progress+0.5/max_length).min(1.0);let a=brake_rate*max_length;let distance=(remaining*max_length-formation::POINT_REACH_RADIUS).max(0.0);
+                let v=((a*a*dt*dt+2.0*a*distance).sqrt()-a*dt).max(0.0).min(distance/dt).min(speed_rate*max_length);
+                (point,v/max_length)
+            }else{(1.0,0.0)};
             for u in group {if u.arrival.held() {continue;}
-                let point=if d.advancing {u.parking.as_ref().unwrap().position}else{d.targets[&u.idx].position};
-                let cap=if d.advancing {None}else{
+                let start=d.targets[&u.idx].position;let goal=u.parking.as_ref().unwrap().position;
+                let point=if d.advancing {start+(goal-start)*progress}else{start};
+                let cap=if d.advancing {Some((rate*start.distance(goal)).min(formation::position(u).distance(point)/dt).min(u.speed))}else{
                     let distance=formation::position(u).distance(point);
                     if distance<=0.06&&u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED {Some(0.0)}else{
                         let distance=(distance-0.04).max(0.0);let a=u.speed*6.0;
@@ -140,16 +237,192 @@ impl Traffic {
             }
         }
         for id in deployed {let d=self.deployments.remove(&id).unwrap();self.events.push(Event{tick,region:d.region,command:id,unit:-1,kind:"deployment-cleared",side:1});}
+        self.staging_space(g,units,tick,dt);
         let now=tick as f64*dt as f64;
         for (index,gate) in self.gates.iter_mut().enumerate() {
             gate.update(index,g,units,tick,now,dt,&mut self.decisions,&mut self.events,&mut self.report);
         }
         self.report.gates=self.gates.len();
     }
-    fn refresh(&mut self,g:&CostGrid) {
-        if self.width==g.w&&self.height==g.h&&self.signature.len()==g.cost.len()&&self.signature.iter().zip(&g.cost).all(|(a,b)|*a==u8::from(*b>0)) {return;}
-        self.width=g.w;self.height=g.h;self.signature=g.cost.iter().map(|v|u8::from(*v>0)).collect();self.gates=discover_gates(g);
+    fn staging_space(&mut self,g:&CostGrid,units:&[Unit],tick:u64,dt:f32) {
+        let live=units.iter().map(|u|(u.idx,u)).collect::<BTreeMap<_,_>>();
+        let returned=self.staging_yields.iter().filter(|(id,t)|t.returning
+            &&live.get(id).is_some_and(|u|u.command_id.is_some_and(|c|c.0==t.command)&&formation::position(u).distance(t.original)<=0.06&&u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED)
+            &&live.get(&t.requester).is_some_and(|u|u.command_id.is_some_and(|c|c.0==t.command))
+            &&self.deployments.get(&t.command).is_some_and(|d|d.targets.get(id).is_some_and(|p|p.position==t.original)))
+            .map(|(&id,_)|id).collect::<Vec<_>>();
+        for id in returned {let task=self.staging_yields.remove(&id).unwrap();self.events.push(Event{tick,region:task.region,command:task.command,unit:id,kind:"staging-yield-done",side:0});}
+        let stale=self.staging_yields.iter().filter(|(id,t)|
+            !live.get(id).is_some_and(|u|u.command_id.is_some_and(|c|c.0==t.command))
+            ||!live.get(&t.requester).is_some_and(|u|u.command_id.is_some_and(|c|c.0==t.command))
+            ||!self.deployments.get(&t.command).is_some_and(|d|!d.advancing&&d.targets.get(id).is_some_and(|p|p.position==t.original)))
+            .map(|(&id,_)|id).collect::<Vec<_>>();
+        for id in stale {let task=self.staging_yields.remove(&id).unwrap();self.events.push(Event{tick,region:task.region,command:task.command,unit:id,kind:"staging-yield-stale",side:0});}
+        let deadline=(12.0/dt).ceil() as u64;
+        let expired=self.staging_yields.iter().filter(|(_,t)|tick.saturating_sub(t.since)>=deadline).map(|(&id,_)|id).collect::<Vec<_>>();
+        for id in expired {let task=self.staging_yields.remove(&id).unwrap();
+            // Release only this temporary controller. The ordinary deployment
+            // and recovery retain the real command, target and progress age.
+            self.review_requests.entry((task.command,task.requester)).and_modify(|since|*since=(*since).min(task.requested_since)).or_insert(task.requested_since);
+            self.review_after.insert((task.command,task.requester),tick+(0.5/dt).ceil() as u64);
+            self.events.push(Event{tick,region:task.region,command:task.command,unit:id,kind:"staging-yield-blocked",side:0});
+            self.events.push(Event{tick,region:task.region,command:task.command,unit:id,kind:"staging-yield-expired",side:0});
+        }
+        let mut done=Vec::new();
+        for (&id,task) in &mut self.staging_yields {
+            let u=live[&id];let here=formation::position(u);let radius=u.parking.as_ref().unwrap().radius;
+            let cleared=task.victims.iter().all(|v|live.get(v).is_none_or(|other|{
+                if other.command_id.is_none_or(|c|c.0!=task.command)||other.arrival.held() {return true;}
+                let reached=self.deployments[&task.command].targets.get(v).is_some_and(|t|
+                    formation::position(other).distance(t.position)<=0.06&&other.vx.hypot(other.vy)<=crate::arrival::QUIET_SPEED);
+                reached||formation::position(other).distance(task.anchor)>formation::PARKING_SPACING*2.0
+            }));
+            if !task.returning&&cleared&&yield_segment_clear(g,units,id,here,task.original,radius) {
+                task.returning=true;task.target.position=task.original;task.target.blocked=None;
+                self.events.push(Event{tick,region:task.region,command:task.command,unit:id,kind:"staging-yield-return",side:0});
+            }
+            if task.returning&&here.distance(task.original)<=0.06&&u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED {
+                done.push(id);continue;
+            }
+            let goal=if task.returning {task.original}else{task.pocket};
+            self.decisions.insert(id,Decision{point:Some(goal),cap:Some(staging_yield_cap(here,goal,u.speed,dt)),phase:Phase::GivingWay,freeze_target:true,..Default::default()});
+        }
+        for id in done {let task=self.staging_yields.remove(&id).unwrap();self.events.push(Event{tick,region:task.region,command:task.command,unit:id,kind:"staging-yield-done",side:0});}
+        self.review_requests.retain(|(command,id),_|self.deployments.get(command).is_some_and(|d|!d.advancing)
+            &&live.get(id).is_some_and(|u|u.command_id.is_some_and(|c|c.0==*command)&&!u.arrival.held())
+            &&self.decisions.get(id).is_some_and(|d|d.phase==Phase::Assembling&&d.cap!=Some(0.0)));
+        self.review_after.retain(|(command,id),_|self.deployments.contains_key(command)&&live.get(id).is_some_and(|u|u.command_id.is_some_and(|c|c.0==*command)));
+        if self.staging_yields.len()>=4 {return;}
+        let mut requests=self.review_requests.iter().filter(|(key,_)|self.review_after.get(key).is_none_or(|after|tick>=*after))
+            .filter(|((command,id),_)|!self.staging_yields.values().any(|t|t.command==*command&&t.requester==*id))
+            .map(|(&(command,id),&since)|(since,command,id)).collect::<Vec<_>>();
+        requests.sort_unstable();let Some((requested_since,command,requester))=requests.first().copied() else{return;};
+        self.review_after.insert((command,requester),tick+(0.5/dt).ceil() as u64);
+        let anchor=formation::position(live[&requester]);let deployment=&self.deployments[&command];
+        let mut holders=units.iter().filter(|u|u.idx!=requester&&u.on_ground&&u.command_id.is_some_and(|c|c.0==command)&&!u.arrival.held()
+            &&!self.staging_yields.contains_key(&u.idx)&&self.decisions.get(&u.idx).is_some_and(|d|d.phase==Phase::Assembling&&d.cap==Some(0.0)))
+            .collect::<Vec<_>>();
+        holders.sort_by(|a,b|formation::position(a).distance_squared(anchor).total_cmp(&formation::position(b).distance_squared(anchor)).then(a.idx.cmp(&b.idx)));
+        for holder in holders.into_iter().take(8) {
+            let here=formation::position(holder);if here.distance(anchor)>formation::PARKING_SPACING*4.0 {continue;}
+            if self.staging_yields.iter().any(|(id,t)|{
+                let other=live[id];let goal=if t.returning {t.original}else{t.pocket};
+                formation::position(other).distance(here)<formation::PARKING_SPACING*4.0
+                    &&(formation::position(other).distance(goal)>0.06||other.vx.hypot(other.vy)>crate::arrival::QUIET_SPEED)
+            }) {continue;}
+            let original=&deployment.targets[&holder.idx];let radius=original.radius;
+            let away=(here-anchor).to_angle();
+            for length in [formation::PARKING_SPACING,formation::PARKING_SPACING*1.5] {for k in 0..8 {
+                let pocket=here+Vec2::from_angle(away+std::f32::consts::TAU*k as f32/8.0)*length;
+                if !yield_segment_clear(g,units,holder.idx,here,pocket,radius) {continue;}
+                if self.deployments.values().flat_map(|d|d.targets.iter()).any(|(id,t)|*id!=holder.idx&&pocket.distance(t.position)<radius+t.radius+0.0001) {continue;}
+                if self.staging_yields.iter().any(|(id,t)|pocket.distance(t.pocket)<radius+live[id].parking.as_ref().unwrap().radius+0.0001) {continue;}
+                let victims=units.iter().filter(|u|u.command_id.is_some_and(|c|c.0==command)&&!self.staging_yields.contains_key(&u.idx)
+                    &&self.decisions.get(&u.idx).is_some_and(|d|d.phase==Phase::Assembling&&d.cap!=Some(0.0))
+                    &&formation::position(u).distance(anchor)<=formation::PARKING_SPACING*4.0).map(|u|u.idx).collect();
+                let mut target=original.clone();target.position=pocket;target.blocked=None;
+                self.staging_yields.insert(holder.idx,StagingYield{command,requester,requested_since,original:original.position,pocket,anchor,victims,since:tick,returning:false,region:deployment.region,target});
+                self.decisions.insert(holder.idx,Decision{point:Some(pocket),cap:Some(staging_yield_cap(here,pocket,holder.speed,dt)),phase:Phase::GivingWay,freeze_target:true,..Default::default()});
+                self.review_requests.remove(&(command,requester));
+                self.events.push(Event{tick,region:deployment.region,command,unit:holder.idx,kind:"staging-yield-start",side:0});return;
+            }}
+        }
+        self.events.push(Event{tick,region:deployment.region,command,unit:requester,kind:"staging-space-unavailable",side:0});
     }
+    fn refresh(&mut self,g:&CostGrid) {
+        if self.width==g.w&&self.height==g.h&&self.signature==g.cost {return;}
+        self.width=g.w;self.height=g.h;self.signature=g.cost.clone();self.gates=discover_gates(g);
+        self.terrain_jobs.clear();self.terrain_attempted.clear();
+        self.staging_yields.clear();self.review_requests.clear();self.review_after.clear();
+        self.routes.retain(|_,r|r.staging.is_none());
+    }
+    fn terrain_detours(&mut self,g:&CostGrid,groups:&BTreeMap<u64,Vec<&Unit>>,centres:&BTreeMap<u64,Vec2>,tick:u64,budget:&mut nav::ReplanBudget) {
+        self.terrain_jobs.retain(|id,_|!self.routes.contains_key(id));
+        for (&id,group) in groups {
+            if group.len()<64||self.routes.contains_key(&id)||self.deployed.contains(&id)||self.terrain_attempted.contains(&id)||group.iter().all(|u|u.arrival.settled())||group.iter().any(|u|!u.parking.as_ref().unwrap().valid) {continue;}
+            self.terrain_attempted.insert(id);
+            let origin=&self.origins[&id];let here=centres[&id];
+            let radius=group.iter().map(|u|formation::position(u).distance(here)+u.parking.as_ref().unwrap().radius).fold(0.0,f32::max)+1.25;
+            if collision::disc_segment_clear(g,here,origin.goal,radius) {continue;}
+            let region=self.next_region;self.next_region+=1;
+            let Some(staging)=deployment(g,origin,group,region) else{continue;};
+            let goal=staging.targets.values().map(|t|t.position).sum::<Vec2>()/group.len() as f32;
+            let start=Cell::new(here.x.round() as i32,here.y.round() as i32);let end=Cell::new(goal.x.round() as i32,goal.y.round() as i32);
+            let point=|c:Cell|Vec2::new(c.x as f32,c.y as f32);
+            if !collision::disc_segment_clear(g,here,point(start),radius)||!collision::disc_segment_clear(g,point(end),goal,radius) {continue;}
+            self.terrain_jobs.insert(id,TerrainJob{radius,goal,search:PathSearch::new(g,start,end),staging});
+            self.events.push(Event{tick,region,command:id,unit:-1,kind:"terrain-search",side:0});
+        }
+        let ids:Vec<_>=self.terrain_jobs.keys().copied().collect();
+        for id in ids {
+            let job=self.terrain_jobs.get_mut(&id).unwrap();let owner=groups[&id][0].idx;
+            let key=nav::SearchKey{owner,command:id,x:job.goal.x.to_bits(),y:job.goal.y.to_bits(),class:2};
+            let permit=budget.request(key,tick);let radius=job.radius;
+            let point=|c:Cell|Vec2::new(c.x as f32,c.y as f32);
+            let status=if permit==0 {SearchStatus::Pending}else{
+                let before=job.search.expanded;
+                let status=job.search.advance(g,permit,&|x,y|!collision::disc_clear(g,Vec2::new(x as f32,y as f32),radius),
+                    &mut |a,b|collision::disc_segment_clear(g,point(a),point(b),radius).then_some(0.0));
+                budget.record(job.search.expanded-before);status
+            };
+            if status==SearchStatus::Pending {
+                let centre=centres[&id];let direction=(job.goal-centre).normalize_or_zero();let next=centre+direction*2.0;
+                if collision::disc_segment_clear(g,centre,next,radius) {for u in &groups[&id] {
+                    self.decisions.insert(u.idx,Decision{point:Some(next+self.origins[&id].offsets[&u.idx]),phase:Phase::Passing,..Default::default()});
+                    self.report.passing+=1;
+                }}
+                continue;
+            }
+            let job=self.terrain_jobs.remove(&id).unwrap();budget.finish(key,status==SearchStatus::Found,0);
+            if status!=SearchStatus::Found {self.report.unavailable+=1;
+                self.events.push(Event{tick,region:job.staging.region,command:id,unit:-1,kind:"terrain-unavailable",side:0});continue;}
+            let cells=&job.search.cells;let mut points=Vec::new();
+            for i in 0..cells.len() {
+                if i>0&&i+1<cells.len()&&cells[i].x-cells[i-1].x==cells[i+1].x-cells[i].x
+                    &&cells[i].y-cells[i-1].y==cells[i+1].y-cells[i].y {continue;}
+                points.push(point(cells[i]));
+            }
+            points.push(job.goal);let region=job.staging.region;let centre=centres[&id];
+            let fits=groups[&id].iter().all(|u|formation::position(u).distance(centre)+u.parking.as_ref().unwrap().radius<=job.radius);
+            let join=if fits {points.iter().position(|p|collision::disc_segment_clear(g,centre,*p,job.radius))}else{None};
+            let Some(join)=join else {self.report.unavailable+=1;
+                self.events.push(Event{tick,region,command:id,unit:-1,kind:"terrain-join-unavailable",side:0});continue;};
+            let mut connected=vec![centre];connected.extend_from_slice(&points[join..]);let points=connected;
+            self.deployments.remove(&id);self.deployed.remove(&id);
+            self.routes.insert(id,Route{points,cursor:0,region,staging:Some(job.staging)});
+            self.events.push(Event{tick,region,command:id,unit:-1,kind:"terrain-route",side:0});
+        }
+    }
+}
+fn yield_segment_clear(g:&CostGrid,units:&[Unit],owner:i32,a:Vec2,b:Vec2,radius:f32)->bool {
+    collision::disc_segment_clear(g,a,b,radius)&&units.iter().filter(|u|u.on_ground&&u.idx!=owner).all(|u|
+        collision::segment_avoids_disc(a,b,formation::position(u),radius+u.parking.as_ref().map_or(0.45,|t|t.radius)))
+}
+fn staging_yield_cap(here:Vec2,goal:Vec2,speed:f32,dt:f32)->f32 {
+    let distance=(here.distance(goal)-0.04).max(0.0);let a=speed*6.0;
+    ((a*a*dt*dt+2.0*a*distance).sqrt()-a*dt).max(0.0).min(distance/dt).min(speed)
+}
+fn deployment(g:&CostGrid,o:&Origin,group:&[&Unit],region:usize)->Option<Deployment> {
+    let direction=o.goal-o.start;let axis=if direction.x.abs()>=direction.y.abs() {Vec2::X*direction.x.signum()}else{Vec2::Y*direction.y.signum()};
+    let peer_radius=group.iter().map(|u|u.parking.as_ref().unwrap().radius).fold(0.0,f32::max);
+    let shift=3.0*o.area+formation::LOCAL_APPROACH_MARGIN+2.0;
+    for k in 0..=(shift/formation::PARKING_SPACING).ceil() as usize {
+        let center=o.goal-axis*(shift-k as f32*formation::PARKING_SPACING).max(0.0);let cell=crate::nav::Cell::new(center.x.round() as i32,center.y.round() as i32);
+        let mut targets=BTreeMap::new();
+        for u in group {let mut t=u.parking.as_ref().unwrap().clone();t.position=center+(t.position-o.goal)*2.0;t.area_radius*=2.0;
+            t.phase=t.phase*2.0+(center-Vec2::new(cell.x as f32,cell.y as f32))/formation::PARKING_SPACING;
+            t.center=cell;t.predecessor=None;t.frozen=true;t.local_active=true;t.blocked=None;targets.insert(u.idx,t);
+        }
+        // A stationary staging member must leave room for a peer to pass
+        // between it and terrain. Actual motion still uses each unit's radius.
+        if !group.iter().all(|u|{let t=&targets[&u.idx];collision::disc_clear(g,t.position,t.radius+2.0*peer_radius)
+            &&collision::disc_segment_clear(g,t.position,u.parking.as_ref().unwrap().position,t.radius)}) {continue;}
+        let guide=if g.cost.contains(&0) {let sources=targets.values().map(|t|crate::nav::Cell::new(t.position.x.round() as i32,t.position.y.round() as i32)).collect::<Vec<_>>();
+            let mut field=crate::nav::FlowField::default();crate::nav::compute_flow_field_cpu_multi(g,&sources,&mut field).then(||std::sync::Arc::new(field))
+        }else{None};
+        let source=group.iter().map(|u|(u.idx,u.parking.as_ref().unwrap().position)).collect();
+        return Some(Deployment{targets,source,advancing:false,region,progress:0.0,progress_mark:0.0,last_progress_tick:0,guide});
+    }None
 }
 fn intersection(a:Vec2,b:Vec2,c:Vec2,d:Vec2)->Option<Vec2> {
     let r=b-a;let s=d-c;let det=r.perp_dot(s);
@@ -297,6 +570,294 @@ mod tests {
         assert_eq!((c.illegal_static_trajectories,c.unresolved_pairs,c.initial_overlaps),(0,0,0));
         assert_eq!(e.traffic.report.incompatible,0);
     }
+    fn staging_review_fixture()->(World,Schedule,Vec<(Entity,i32)>,BTreeMap<i32,Vec2>,u64) {
+        let mut w=World::new();nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::Single,per_group:64,..default()}).unwrap();
+        let mut schedule=nav_scenario::schedule();schedule.run(&mut w);safe(&w);
+        let entities=w.query::<(Entity,&Unit)>().iter(&w).map(|(e,u)|(e,u.idx)).collect::<Vec<_>>();
+        let command=w.get::<Unit>(entities[0].0).unwrap().command_id.unwrap().0;
+        let stage=w.resource::<SimEnv>().traffic.deployments[&command].targets.iter().map(|(id,t)|(*id,t.position)).collect::<BTreeMap<_,_>>();
+        // Reproduce an already assembled group with one unresolved local entry.
+        // From this initial snapshot all motion uses the production schedule.
+        for (e,id) in &entities {let mut u=w.get_mut::<Unit>(*e).unwrap();let p=if *id==0 {stage[&1]+Vec2::splat(0.95)}else{stage[id]};
+            u.cell_x=p.x;u.cell_y=p.y;u.vx=0.0;u.vy=0.0;u.preferred_velocity=None;}
+        schedule.run(&mut w);safe(&w);
+        let tick=w.resource::<SimEnv>().tick;w.resource_mut::<SimEnv>().traffic.request_review(0,command,tick);
+        schedule.run(&mut w);safe(&w);
+        assert!(w.resource::<SimEnv>().traffic.events.iter().any(|e|e.kind=="staging-yield-start"),
+            "an explicit staging review did not create a physical giving-way task");
+        (w,schedule,entities,stage,command)
+    }
+    #[test]
+    fn a_staging_review_opens_a_pocket_and_restores_the_original_targets() {
+        let (mut w,mut schedule,entities,stage,command)=staging_review_fixture();
+        let original_positions=w.resource::<SimEnv>().traffic.deployments[&command].source.clone();
+        let original=entities.iter().map(|(e,id)|(*id,(w.get::<Unit>(*e).unwrap().command_id,original_positions[id]))).collect::<BTreeMap<_,_>>();
+        let holder=w.resource::<SimEnv>().traffic.events.iter().find(|e|e.kind=="staging-yield-start").unwrap().unit;
+        let holder_entity=entities.iter().find(|(_,id)|*id==holder).unwrap().0;
+        let mut parked=None;let mut completed=false;let mut moved_aside=false;
+        for tick in 0..2400 {schedule.run(&mut w);safe(&w);
+            let u=w.get::<Unit>(holder_entity).unwrap();if u.traffic_phase==Phase::GivingWay&&formation::position(u).distance(stage[&holder])>0.2 {moved_aside=true;}
+            for (e,id) in &entities {let u=w.get::<Unit>(*e).unwrap();assert_eq!(u.command_id,original[id].0);assert_eq!(u.parking.as_ref().unwrap().position,original[id].1);}
+            if nav_scenario::all_parked(&mut w) {let since=*parked.get_or_insert(tick);if tick-since>=180 {completed=true;break;}}else{parked=None;}
+        }
+        assert!(completed,"giving-way did not finish with real stable parking");
+        assert!(moved_aside,"giving-way never produced a real displacement");
+        assert!(w.resource::<SimEnv>().traffic.events.iter().any(|e|e.kind=="staging-yield-done"),"events={:?}",
+            w.resource::<SimEnv>().traffic.events.iter().filter(|e|e.kind.starts_with("staging-")).take(32).collect::<Vec<_>>());
+        assert!(w.query::<&Unit>().iter(&w).all(|u|u.arrival.max_drift<=0.05));
+    }
+    #[test]
+    fn slow_coherent_members_do_not_start_individual_detours_while_the_group_advances() {
+        let (mut w,_,command)=compression_fixture();let mut units=w.query::<&Unit>().iter(&w).cloned().collect::<Vec<_>>();units.sort_by_key(|u|u.idx);
+        let mut env=w.remove_resource::<SimEnv>().unwrap();let first=env.tick;
+        let stage=env.traffic.deployments[&command].targets.iter().map(|(id,t)|(*id,t.position)).collect::<BTreeMap<_,_>>();
+        assert!(units.iter().any(|u|{let d=stage[&u.idx].distance(u.parking.as_ref().unwrap().position);d>1.2&&d<3.0}),"fixture needs a short, unfinished contraction path");
+        // Feed the progress observer legal, gently accelerated homothetic
+        // snapshots. This isolates classification, not a motion acceptance run.
+        // Short paths move less than 0.2 while the common layout keeps advancing.
+        for n in 0..180 {let time=n as f32/60.0;let progress=if time<1.0 {0.01*time*time}else{0.01+0.02*(time-1.0)};let rate=0.02*time.min(1.0);
+            for u in &mut units {let start=stage[&u.idx];let path=u.parking.as_ref().unwrap().position-start;let p=start+path*progress;
+                u.cell_x=p.x;u.cell_y=p.y;u.vx=path.x*rate;u.vy=path.y*rate;}
+            let tick=first+n;env.buffers.local_routes.budget.begin(tick);
+            env.traffic.update(&env.nav,&units,tick,1.0/60.0,&mut env.buffers.local_routes.budget);
+            for u in &mut units {let d=env.traffic.decision(u.idx);u.traffic_phase=d.phase;u.traffic_hold=d.cap==Some(0.0);}
+            env.recovery.update(&env.nav,&mut units,&env.traffic,tick,1.0/60.0,&mut env.buffers.local_routes.budget);
+            assert!(env.traffic.deployments[&command].advancing);
+            assert!(!env.recovery.events.iter().any(|e|e.tick==tick&&matches!(e.kind,"yield-start"|"pocket-start"|"search-start")),
+                "individual recovery bent a still-progressing coherent deployment: progress={} tick={} events={:?}",progress,tick,
+                env.recovery.events.iter().filter(|e|e.tick==tick).take(8).collect::<Vec<_>>());
+        }
+        assert!(env.traffic.deployments[&command].progress>0.04);
+    }
+    fn compression_fixture()->(World,Schedule,u64) {
+        let mut w=World::new();nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::SingleWidth,per_group:1024,seed:9,jitter:0.02,..default()}).unwrap();
+        let mut schedule=nav_scenario::schedule();let command=w.query::<&Unit>().iter(&w).next().unwrap().command_id.unwrap().0;
+        for _ in 0..240 {schedule.run(&mut w);safe(&w);if w.resource::<SimEnv>().traffic.deployments.contains_key(&command) {break;}}
+        let stage=w.resource::<SimEnv>().traffic.deployments[&command].targets.iter().map(|(id,t)|(*id,t.position)).collect::<BTreeMap<_,_>>();
+        // Start from a legal expanded physical snapshot, with the same small
+        // alignment errors as the real compression boundary. Later motion is
+        // performed only by the production schedule.
+        for mut u in w.query::<&mut Unit>().iter_mut(&mut w) {let angle=u.idx as f32*1.37;let p=stage[&u.idx]+Vec2::from_angle(angle)*0.04;
+            u.cell_x=p.x;u.cell_y=p.y;u.vx=0.0;u.vy=0.0;u.preferred_velocity=None;u.no_progress_seconds=0.0;}
+        w.resource_mut::<SimEnv>().recovery=crate::recovery::Recovery::default();
+        (w,schedule,command)
+    }
+    #[test]
+    fn a_stationary_coherent_deployment_still_enters_recovery() {
+        let (mut w,_,command)=compression_fixture();let mut units=w.query::<&Unit>().iter(&w).cloned().collect::<Vec<_>>();units.sort_by_key(|u|u.idx);
+        let mut env=w.remove_resource::<SimEnv>().unwrap();let first=env.tick;
+        // Probe an unchanged physical snapshot. A finite coordination wait
+        // cannot keep suppressing recovery when the group never advances.
+        for n in 1..=180 {let tick=first+n;env.buffers.local_routes.budget.begin(tick);
+            env.traffic.update(&env.nav,&units,tick,1.0/60.0,&mut env.buffers.local_routes.budget);
+            for u in &mut units {let d=env.traffic.decision(u.idx);u.traffic_phase=d.phase;u.traffic_hold=d.cap==Some(0.0);}
+            env.recovery.update(&env.nav,&mut units,&env.traffic,tick,1.0/60.0,&mut env.buffers.local_routes.budget);
+            assert!(env.recovery.report.expanded<=crate::recovery::EXPANSIONS_PER_TICK);
+        }
+        assert!(env.recovery.events.iter().any(|e|matches!(e.kind,"yield-start"|"pocket-start"|"replan-queued"|"search-start")),"a stationary group was hidden by an unlimited coordination wait");
+        assert!(units.iter().all(|u|u.command_id.is_some_and(|c|c.0==command)&&!u.arrival.settled()&&u.no_progress_seconds>=2.9));
+    }
+    #[test]
+    fn a_blocked_giving_way_task_returns_control_without_refreshing_wait_age() {
+        let (mut w,_,_,_,command)=staging_review_fixture();
+        let units=w.query::<&Unit>().iter(&w).cloned().collect::<Vec<_>>();
+        let mut env=w.remove_resource::<SimEnv>().unwrap();
+        let (&holder,task)=env.traffic.staging_yields.iter().next().unwrap();
+        let started=task.since;let requester=task.requester;
+        let requested=env.traffic.events.iter().filter(|e|e.kind=="route-review"&&e.unit==requester).map(|e|e.tick).min().unwrap();
+        let before=units.iter().map(|u|(u.idx,(formation::position(u),u.command_id,u.parking.as_ref().unwrap().position,u.no_progress_seconds))).collect::<BTreeMap<_,_>>();
+        // A persistently blocked physical snapshot must not hold the finite
+        // giving-way controller forever. Only the clock advances in this probe.
+        let tick=started+720;env.buffers.local_routes.budget.begin(tick);
+        env.traffic.update(&env.nav,&units,tick,1.0/60.0,&mut env.buffers.local_routes.budget);
+        assert_ne!(env.traffic.decision(holder).phase,Phase::GivingWay,
+            "an expired giving-way task still prevents ordinary recovery");
+        assert!(env.traffic.events.iter().any(|e|e.unit==holder&&e.kind=="staging-yield-expired"));
+        assert_eq!(env.traffic.review_requests.get(&(command,requester)),Some(&requested),"review wait age was refreshed");
+        for u in &units {let p=&before[&u.idx];assert_eq!((formation::position(u),u.command_id,u.parking.as_ref().unwrap().position,u.no_progress_seconds),*p);}
+    }
+    #[test]
+    fn retargeting_a_giving_way_member_discards_the_old_pocket() {
+        let (mut w,mut schedule,entities,_,old_command)=staging_review_fixture();
+        let holder=w.resource::<SimEnv>().traffic.events.iter().find(|e|e.kind=="staging-yield-start").unwrap().unit;
+        let entity=entities.iter().find(|(_,id)|*id==holder).unwrap().0;
+        play::issue_orders_at(&mut w,&[(vec![entity],Cell::new(20,20))]);let command=w.get::<Unit>(entity).unwrap().command_id;
+        assert_ne!(command.map(|c|c.0),Some(old_command));
+        schedule.run(&mut w);safe(&w);
+        assert!(!w.resource::<SimEnv>().traffic.staging_yields.contains_key(&holder));
+        assert_ne!(w.resource::<SimEnv>().traffic.decision(holder).phase,Phase::GivingWay);
+        assert!(w.resource::<SimEnv>().traffic.events.iter().any(|e|e.unit==holder&&e.kind=="staging-yield-stale"));
+        let mut completed=false;
+        for _ in 0..2400 {schedule.run(&mut w);safe(&w);let u=w.get::<Unit>(entity).unwrap();assert_eq!(u.command_id,command);
+            if u.arrival.settled() {completed=true;break;}}
+        assert!(completed,"the old yielding task prevented completion of a replacement order");
+    }
+    #[test]
+    fn group_route_keeps_front_members_until_the_staging_region() {
+        let mut w=World::new();nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::SingleObstacle,per_group:1024,..default()}).unwrap();
+        let mut schedule=nav_scenario::schedule();schedule.run(&mut w);
+        let mut units:Vec<_>=w.query::<&Unit>().iter(&w).cloned().collect();units.sort_by_key(|u|u.idx);
+        let mut env=w.remove_resource::<SimEnv>().unwrap();let command=units[0].command_id.unwrap().0;
+        let job=env.traffic.terrain_jobs.remove(&command).unwrap();
+        env.traffic.routes.insert(command,Route{points:vec![job.goal],cursor:0,region:job.staging.region,staging:Some(job.staging)});
+        for u in &mut units {u.cell_x+=100.0;assert!(collision::disc_clear(&env.nav,formation::position(u),u.parking.as_ref().unwrap().radius));}
+        let front=&mut units[511];let t=front.parking.as_mut().unwrap();t.local_active=true;
+        assert!(Vec2::new(front.cell_x,front.cell_y).distance(Vec2::new(t.center.x as f32,t.center.y as f32))<t.area_radius+formation::LOCAL_APPROACH_MARGIN);
+        let tick=env.tick+1;env.buffers.local_routes.budget.begin(tick);
+        env.traffic.update(&env.nav,&units,tick,1.0/60.0,&mut env.buffers.local_routes.budget);
+        assert_eq!(env.traffic.decision(511).phase,Phase::Passing,"front member abandoned a live group terrain route");
+        assert!(env.traffic.decision(511).point.is_some());
+    }
+    #[test]
+    fn group_route_uses_repaired_parking_targets() {
+        let mut w=World::new();nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::SingleObstacle,per_group:64,..default()}).unwrap();
+        let mut schedule=nav_scenario::schedule();schedule.run(&mut w);
+        let owner=w.query::<(Entity,&Unit)>().iter(&w).find(|(_,u)|u.idx==0).unwrap().0;
+        let command=w.get::<Unit>(owner).unwrap().command_id.unwrap();
+        let old=w.resource::<SimEnv>().traffic.terrain_jobs[&command.0].staging.targets[&0].position;
+        // A repair changes one valid reservation without issuing a new command.
+        let repaired={let mut u=w.get_mut::<Unit>(owner).unwrap();let t=u.parking.as_mut().unwrap();t.position.y-=formation::PARKING_SPACING;
+            let p=t.position;u.goal=Cell::new(p.x.round() as i32,p.y.round() as i32);p};
+        {let mut env=w.resource_mut::<SimEnv>();env.reservations.claims.get_mut(&0).unwrap().position=repaired;env.reservations.rebuild_owners();}
+        schedule.run(&mut w);safe(&w);
+        let env=w.resource::<SimEnv>();let current=env.traffic.terrain_jobs[&command.0].staging.targets[&0].position;
+        assert!(current.distance(old-Vec2::Y*formation::PARKING_SPACING*2.0)<0.001,"pending group route kept a repaired target's old position");
+        assert_eq!(w.get::<Unit>(owner).unwrap().command_id,Some(command));assert_eq!(env.reservations.claims.len(),64);
+    }
+    #[test]
+    fn group_route_rejoins_the_current_legal_snapshot() {
+        let mut w=World::new();nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::SingleObstacle,per_group:64,..default()}).unwrap();
+        let mut schedule=nav_scenario::schedule();schedule.run(&mut w);
+        let mut units:Vec<_>=w.query::<&Unit>().iter(&w).cloned().collect();units.sort_by_key(|u|u.idx);
+        let mut env=w.remove_resource::<SimEnv>().unwrap();let command=units[0].command_id.unwrap().0;
+        let job=env.traffic.terrain_jobs.get_mut(&command).unwrap();let end=Cell::new(job.goal.x.round() as i32,job.goal.y.round() as i32);
+        // Feed a completed legal planner trail and a newer legal position snapshot.
+        // This isolates route handoff; it is not a movement or completion benchmark.
+        let controls=[Cell::new(32,80),Cell::new(84,45),Cell::new(106,45),end];let mut cells=vec![controls[0]];
+        for edge in controls.windows(2) {let a=edge[0];let b=edge[1];let n=(b.x-a.x).abs().max((b.y-a.y).abs());
+            for i in 1..=n {cells.push(Cell::new((a.x as f32+(b.x-a.x) as f32*i as f32/n as f32).round() as i32,
+                (a.y as f32+(b.y-a.y) as f32*i as f32/n as f32).round() as i32));}}
+        let point=|c:Cell|Vec2::new(c.x as f32,c.y as f32);
+        assert!(cells.windows(2).all(|p|collision::disc_segment_clear(&env.nav,point(p[0]),point(p[1]),job.radius)));
+        job.search.cells=cells;job.search.status=SearchStatus::Found;
+        for u in &mut units {u.cell_x+=74.0;assert!(collision::disc_clear(&env.nav,formation::position(u),u.parking.as_ref().unwrap().radius));}
+        let seen=env.tick+1;let key=nav::SearchKey{owner:units[0].idx,command,x:job.goal.x.to_bits(),y:job.goal.y.to_bits(),class:2};
+        env.buffers.local_routes.budget.request(key,seen);
+        let tick=seen+1;env.buffers.local_routes.budget.begin(tick);
+        env.traffic.update(&env.nav,&units,tick,1.0/60.0,&mut env.buffers.local_routes.budget);
+        assert!(env.traffic.events.iter().any(|e|e.kind=="terrain-route"));
+        for u in &units {let next=env.traffic.decision(u.idx).point.unwrap();
+            assert!(collision::disc_segment_clear(&env.nav,formation::position(u),next,u.parking.as_ref().unwrap().radius),"route handoff crossed terrain from the current snapshot");}
+    }
+    #[test]
+    fn retargeting_a_group_discards_its_pending_terrain_route() {
+        let mut w=World::new();
+        nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::SingleObstacle,per_group:64,sample_every:1,..default()}).unwrap();
+        let mut schedule=nav_scenario::schedule();schedule.run(&mut w);safe(&w);
+        let old=w.query::<&Unit>().iter(&w).next().unwrap().command_id.unwrap();
+        let entities:Vec<_>=w.query::<(Entity,&Unit)>().iter(&w).map(|(e,_)|e).collect();
+        assert_eq!(play::issue_orders_at(&mut w,&[(entities,Cell::new(32,120))])[0].accepted,64);
+        let current=w.query::<&Unit>().iter(&w).next().unwrap().command_id.unwrap();assert_ne!(old,current);
+        for _ in 0..3 {schedule.run(&mut w);safe(&w);}
+        assert!(!w.resource::<SimEnv>().traffic.events.iter().any(|e|e.command==old.0&&e.kind=="terrain-route"));
+        assert!(!w.resource::<SimEnv>().traffic.terrain_jobs.contains_key(&old.0));
+        assert!(!w.resource::<SimEnv>().traffic.routes.contains_key(&old.0));
+        assert!(w.query::<&Unit>().iter(&w).all(|u|u.command_id==Some(current)&&u.parking.as_ref().unwrap().center==Cell::new(32,120)&&!u.arrival.settled()));
+        assert_eq!(w.resource::<SimEnv>().reservations.claims.len(),64);
+    }
+    #[test]
+    fn a_budgeted_group_detour_clears_terrain_and_stays_parked() {
+        let mut w=World::new();
+        nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::SingleObstacle,per_group:64,sample_every:1,..default()}).unwrap();
+        let commands:BTreeMap<_,_>=w.query::<&Unit>().iter(&w).map(|u|(u.idx,u.command_id)).collect();
+        let mut schedule=nav_scenario::schedule();schedule.run(&mut w);safe(&w);
+        assert!(w.query::<&Unit>().iter(&w).all(|u|u.start_delay==0.0&&u.vx.hypot(u.vy)>0.01),"group planning staggered the command startup");
+        let mut parked=None;let mut complete=None;let mut expanded=0;
+        for tick in 2..=4200 {
+            schedule.run(&mut w);safe(&w);
+            let env=w.resource::<SimEnv>();assert!(env.recovery.report.expanded<=nav::ReplanBudget::LIMIT);
+            expanded+=env.recovery.report.expanded;
+            for u in w.query::<&Unit>().iter(&w) {assert_eq!(u.command_id,commands[&u.idx]);}
+            if nav_scenario::all_parked(&mut w) {let since=*parked.get_or_insert(tick);if tick-since>=180 {complete=Some(since);break;}}
+            else{parked=None;}
+        }
+        assert!(complete.is_some(),"coherent terrain detour did not complete and hold parking");
+        let env=w.resource::<SimEnv>();assert!(env.traffic.events.iter().any(|e|e.kind=="terrain-route"));assert!(expanded>0);
+        assert_eq!(env.reservations.claims.len(),64);
+        assert!(w.query::<&Unit>().iter(&w).all(|u|u.arrival.max_drift<=0.05));
+        println!("traffic_terrain_complete tick={} parked_ticks=180 expanded={expanded}",complete.unwrap());
+    }
+    #[test]
+    fn a_wall_side_staging_target_leaves_room_for_a_full_sized_peer() {
+        let mut w=World::new();nav_scenario::populate(&mut w,&SceneConfig{kind:nav_scenario::SceneKind::SingleWidth,per_group:1024,..default()}).unwrap();
+        let mut schedule=nav_scenario::schedule();schedule.run(&mut w);safe(&w);
+        let command=w.query::<&Unit>().iter(&w).next().unwrap().command_id.unwrap().0;
+        let env=w.resource::<SimEnv>();
+        let staging=&env.traffic.terrain_jobs[&command].staging;
+        let target=staging.targets.values().min_by(|a,b|a.position.x.total_cmp(&b.position.x)).unwrap();
+        // The corridor wall ends at112.5. A moving peer's centre must stay to
+        // its right while a staged member holds its actual expanded position.
+        let lane=112.5+target.radius+0.05;
+        let a=Vec2::new(lane,target.position.y-formation::PARKING_SPACING);
+        let b=Vec2::new(lane,target.position.y+formation::PARKING_SPACING);
+        assert!(collision::disc_segment_clear(&env.nav,a,b,target.radius));
+        let bodies=[formation::Body{id:9999,position:target.position,radius:target.radius,departing:false,idle:false}];
+        let mut index=crate::spatial::Index::default();index.rebuild(&[crate::spatial::Aabb::point(target.position)]);let mut neighbors=Vec::new();
+        let mut q=crate::local_nav::Query{grid:&env.nav,bodies:&bodies,index:&mut index,neighbors:&mut neighbors,owner:-1,radius:target.radius,max_radius:target.radius};
+        assert!(q.clear(a,b,true),"a staged member sealed the wall-side exit aisle for a full-sized peer");
+    }
+    #[test]
+    fn assembly_guide_replans_around_a_confirmed_holding_body() {
+        let mut g=CostGrid{w:192,h:160,cost:vec![1;192*160],..Default::default()};
+        for y in 54..=106 {for x in 92..=98 {g.cost[y*192+x]=0;}}
+        let here=Vec2::new(85.0,80.0);let body=formation::Body{id:7,position:here,radius:0.45,departing:true,idle:false};
+        let mut plan=formation::plan(&g,&formation::components(&g),Cell::new(160,80),&[body],&[body],
+            &BTreeSet::from([7]),&mut formation::Reservations::default(),None).unwrap();
+        let mut target=plan.targets.remove(0).1;target.center=Cell::new(134,80);target.area_radius=48.0;
+        let next=nav::flow_step(&g,&plan.guide,Cell::new(85,80)).unwrap();
+        let direction=(Vec2::new(next.x as f32,next.y as f32)-here).normalize();
+        let holding=formation::Body{id:8,position:here+direction*1.2,radius:0.45,departing:false,idle:false};
+        assert!(here.distance(holding.position)>body.radius+holding.radius);
+        let mut traffic=Traffic::default();traffic.deployments.insert(1,Deployment{source:BTreeMap::from([(7,target.position)]),
+            targets:BTreeMap::from([(7,target)]),advancing:false,region:0,progress:0.0,progress_mark:0.0,last_progress_tick:0,guide:Some(plan.guide)});
+        traffic.decisions.insert(7,Decision{phase:Phase::Assembling,..Default::default()});
+        let mut index=crate::spatial::Index::default();index.rebuild(&[crate::spatial::Aabb::point(holding.position)]);let mut neighbors=Vec::new();
+        let bodies=[holding];let mut q=crate::local_nav::Query{grid:&g,bodies:&bodies,index:&mut index,neighbors:&mut neighbors,owner:7,radius:0.45,max_radius:0.45};
+        let mut routes=crate::local_nav::Routes::default();
+        let actual=traffic.assembly_direction(7,1,here,0,&mut q,&mut routes).unwrap();
+        assert!(actual==Vec2::ZERO||q.clear(here,here+actual,true),"shared guide bypassed a confirmed holding body");
+        assert_eq!(routes.budget.pending(),1,"a blocked guide did not request the shared local planner");
+        assert_eq!(traffic.deployments[&1].targets[&7].blocked,Some(formation::TargetBlock::SearchBudget));
+    }
+    #[test]
+    fn assembly_keeps_the_static_guide_inside_a_large_local_region() {
+        let mut g=CostGrid{w:192,h:160,cost:vec![1;192*160],..Default::default()};
+        for y in 54..=106 {for x in 92..=98 {g.cost[y*192+x]=0;}}
+        let here=Vec2::new(85.0,80.0);
+        let body=formation::Body{id:7,position:here,radius:0.45,departing:true,idle:false};
+        let mut plan=formation::plan(&g,&formation::components(&g),Cell::new(160,80),&[body],&[body],
+            &BTreeSet::from([7]),&mut formation::Reservations::default(),None).unwrap();
+        let mut target=plan.targets.remove(0).1;target.center=Cell::new(134,80);target.area_radius=48.0;
+        target.blocked=Some(formation::TargetBlock::SearchBudget);
+        assert!(here.distance(Vec2::new(134.0,80.0))<target.area_radius+formation::LOCAL_APPROACH_MARGIN);
+        assert!(!collision::disc_segment_clear(&g,here,target.position,target.radius));
+        let next=crate::nav::flow_step(&g,&plan.guide,Cell::new(85,80)).unwrap();
+        let expected=(Vec2::new(next.x as f32,next.y as f32)-here).normalize();
+        assert!(collision::disc_segment_clear(&g,here,here+expected,target.radius));
+        let mut traffic=Traffic::default();traffic.deployments.insert(1,Deployment{source:BTreeMap::from([(7,target.position)]),targets:BTreeMap::from([(7,target)]),
+            advancing:false,region:0,progress:0.0,progress_mark:0.0,last_progress_tick:0,guide:Some(plan.guide)});
+        traffic.decisions.insert(7,Decision{phase:Phase::Assembling,..Default::default()});
+        let mut index=crate::spatial::Index::default();let mut neighbors=Vec::new();
+        let mut q=crate::local_nav::Query{grid:&g,bodies:&[],index:&mut index,neighbors:&mut neighbors,owner:7,radius:0.45,max_radius:0.45};
+        let mut routes=crate::local_nav::Routes::default();
+        let actual=traffic.assembly_direction(7,1,here,0,&mut q,&mut routes).unwrap();
+        assert!(actual.dot(expected)>0.99,"existing terrain detour was replaced by a per-unit search");
+        assert_eq!(routes.budget.pending(),0);
+        assert_eq!(traffic.deployments[&1].targets[&7].blocked,None);
+        let metric=traffic.progress_metric(7,1,here,Vec2::new(160.0,80.0),&g).unwrap();
+        let advanced=traffic.progress_metric(7,1,here+expected,Vec2::new(160.0,80.0),&g).unwrap();
+        assert_eq!(metric.1,5);assert!(advanced.0<metric.0);
+    }
     #[test]
     fn encounter_routes_keep_their_side_and_all_four_groups_start_together() {
         let mut w=World::new();nav_scenario::populate(&mut w,&SceneConfig::default()).unwrap();let mut s=nav_scenario::schedule();s.run(&mut w);safe(&w);
@@ -309,15 +870,24 @@ mod tests {
         for (id,r) in &traffic.routes {assert_eq!(r.points,paths[id]);}
     }
     #[test]
+    fn readmission_review_keeps_waiting_age_and_does_not_reverse_an_entered_token() {
+        let mut traffic=Traffic::default();traffic.gates.push(Gate{axis:Vec2::X,lateral:Vec2::Y,lo:10.5,hi:20.5,across:12.0,
+            waiters:BTreeMap::from([(7,Waiter{side:1,command:3,since:2.0,slot:0})]),
+            tokens:BTreeMap::from([(7,Token{side:1,rank:0,started:false,entered:false,aligned:false})]),owner:Some(1),last:None,opened:3.0,exit_blocked:false});
+        traffic.request_review(7,3,600);assert_eq!(traffic.gates[0].waiters[&7].since,2.0);assert!(!traffic.gates[0].tokens.contains_key(&7));
+        traffic.gates[0].tokens.insert(7,Token{side:1,rank:0,started:true,entered:true,aligned:true});
+        traffic.request_review(7,3,700);assert_eq!(traffic.gates[0].waiters[&7].since,2.0);assert_eq!(traffic.gates[0].tokens[&7].side,1);
+    }
+    #[test]
     fn retargeted_assembly_uses_only_the_current_command_and_phase() {
         let g=CostGrid{w:30,h:24,cost:vec![1;30*24],..Default::default()};let here=Vec2::new(12.0,12.0);
         let body=formation::Body{id:7,position:here,radius:0.45,departing:true,idle:false};
         let mut target=formation::plan(&g,&formation::components(&g),Cell::new(18,12),&[body],&[body],
             &BTreeSet::from([7]),&mut formation::Reservations::default(),None).unwrap().targets.remove(0).1;
         target.position=Vec2::new(6.0,12.0);let mut traffic=Traffic::default();
-        traffic.deployments.insert(1,Deployment{targets:BTreeMap::from([(7,target.clone())]),advancing:false,region:0});
+        traffic.deployments.insert(1,Deployment{source:BTreeMap::from([(7,target.position)]),targets:BTreeMap::from([(7,target.clone())]),advancing:false,region:0,progress:0.0,progress_mark:0.0,last_progress_tick:0,guide:None});
         target.position=Vec2::new(18.0,12.0);
-        traffic.deployments.insert(2,Deployment{targets:BTreeMap::from([(7,target)]),advancing:false,region:1});
+        traffic.deployments.insert(2,Deployment{source:BTreeMap::from([(7,target.position)]),targets:BTreeMap::from([(7,target)]),advancing:false,region:1,progress:0.0,progress_mark:0.0,last_progress_tick:0,guide:None});
         traffic.decisions.insert(7,Decision{phase:Phase::Assembling,..Default::default()});
         let mut index=crate::spatial::Index::default();let mut neighbors=Vec::new();
         let mut q=crate::local_nav::Query{grid:&g,bodies:&[],index:&mut index,neighbors:&mut neighbors,owner:7,radius:0.45,max_radius:0.45};

@@ -839,6 +839,7 @@ pub fn run(args: Vec<String>) {
         use_crowd: cfg.crowd,
         velocity_mode: crate::crowd::VelocityMode::Orca,
         traffic: crate::traffic::Traffic::default(),
+        recovery: crate::recovery::Recovery::default(),
         pressure: crate::crowd::Pressure::default(),
         crowd_params: crate::crowd::Params::default(),
         since_pressure: 0,

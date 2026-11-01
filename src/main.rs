@@ -5,6 +5,7 @@ mod crowd;
 mod orca;
 mod orca_obstacles;
 mod traffic;
+mod recovery;
 mod arrival;
 mod formation;
 mod collision;
