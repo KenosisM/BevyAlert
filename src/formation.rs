@@ -43,7 +43,7 @@ impl Reservations {
 }
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum TargetBlock {Entrance,InvalidPosition,OccupiedPosition,NoLocalPath}
+pub enum TargetBlock {Entrance,InvalidPosition,OccupiedPosition,NoLocalPath,SearchBudget}
 #[derive(Clone,Debug)]
 pub struct Target {
     pub position:Vec2,pub center:Cell,pub radius:f32,pub area_radius:f32,pub side:usize,pub phase:Vec2,
@@ -61,9 +61,11 @@ impl Target {
         let broken=self.route.get(self.cursor..).is_some_and(|p|p.windows(2).any(|e|!q.clear(e[0],e[1],true)));
         if self.route_goal!=Some(goal)||self.cursor>=self.route.len()||broken {
             self.route.clear();self.cursor=0;self.route_goal=Some(goal);
-            let path=routes.path(self,from,goal,command,tick,q);
-            if path.is_empty() {self.blocked=Some(TargetBlock::NoLocalPath);return Vec2::ZERO;}
-            self.route.extend(path);
+            match routes.path(self,from,goal,command,tick,q) {
+                crate::local_nav::RouteResult::Ready(path)=>self.route.extend(path),
+                crate::local_nav::RouteResult::Pending=>{self.blocked=Some(TargetBlock::SearchBudget);return Vec2::ZERO;}
+                crate::local_nav::RouteResult::NoPath=>{self.blocked=Some(TargetBlock::NoLocalPath);return Vec2::ZERO;}
+            }
         }
         while self.cursor+1<self.route.len() {
             let p=self.route[self.cursor+1];
@@ -77,7 +79,7 @@ impl Target {
         self.blocked=None;(waypoint-from).normalize_or_zero()
     }
     pub fn remaining_distance(&self,here:Vec2,goal:Vec2)->f32 {
-        if self.blocked==Some(TargetBlock::NoLocalPath)||!self.valid {return f32::INFINITY;}
+        if matches!(self.blocked,Some(TargetBlock::NoLocalPath|TargetBlock::SearchBudget))||!self.valid {return f32::INFINITY;}
         if self.route_goal==Some(goal)&&self.cursor<self.route.len() {
             here.distance(self.route[self.cursor])+self.route[self.cursor..].windows(2).map(|p|p[0].distance(p[1])).sum::<f32>()
         }else{here.distance(goal)}
@@ -278,7 +280,7 @@ pub fn maintain(env:&mut crate::world::SimEnv,units:&mut [crate::world::Unit]) {
     let active:BTreeSet<_>=units.iter().filter_map(|u|u.command_id.map(|c|c.0)).collect();env.buffers.local_routes.prune(&active);
     env.buffers.idle_index.begin_tick();env.buffers.idle_bodies.clear();
     env.buffers.idle_bodies.extend(units.iter().filter(|u|u.on_ground&&(u.goal.x<0||u.parking.as_ref().is_some_and(|t|
-        u.vx.hypot(u.vy)<=0.05&&(position(u).distance(t.position)<=POINT_REACH_RADIUS||u.arrival.held()||t.blocked==Some(TargetBlock::Entrance)||u.contact_hold))))
+        u.vx.hypot(u.vy)<=0.05&&(position(u).distance(t.position)<=POINT_REACH_RADIUS||u.arrival.held()||t.blocked==Some(TargetBlock::Entrance)||u.traffic_hold))))
         .map(|u|body(u,env.crowd_params.radius_default())));
     let idle_radius=env.buffers.idle_bodies.iter().map(|b|b.radius).fold(0.0f32,f32::max);
     env.buffers.idle_bounds.clear();env.buffers.idle_bounds.extend(env.buffers.idle_bodies.iter().map(|b|Aabb::point(b.position)));
@@ -294,9 +296,12 @@ pub fn maintain(env:&mut crate::world::SimEnv,units:&mut [crate::world::Unit]) {
         }
         if !t.valid {if let Some(command)=u.command_id {invalid.entry(command.0).or_default().push(i);}}
     }}
-    if !invalid.is_empty()&&env.tick%30==0 {
+    let repairs=invalid.keys().copied().collect();
+    let repair=env.recovery.target_repair_turn(&repairs,env.tick,env.runtime.dt());
+    if let Some(repair)=repair {
         let labels=components(&env.nav);let all:Vec<_>=units.iter().filter(|u|u.on_ground).map(|u|body(u,env.crowd_params.radius_default())).collect();
         for (command,indices) in invalid {
+            if command!=repair {continue;}
             let old=units[indices[0]].parking.as_ref().unwrap();let layout=(old.side,old.phase);
             let Some(center)=crate::play::nearest_usable(&env.nav,old.center) else{continue;};
             let requested:Vec<_>=indices.iter().map(|i|body(&units[*i],env.crowd_params.radius_default())).collect();
@@ -342,7 +347,7 @@ pub fn maintain(env:&mut crate::world::SimEnv,units:&mut [crate::world::Unit]) {
 pub fn motion_goal(u:&crate::world::Unit)->Vec2 {
     let here=position(u);
     let Some(t)=&u.parking else{return parking_position(u);};
-    if !t.valid||matches!(t.blocked,Some(TargetBlock::InvalidPosition|TargetBlock::NoLocalPath)) {return here;}
+    if !t.valid||matches!(t.blocked,Some(TargetBlock::InvalidPosition|TargetBlock::NoLocalPath|TargetBlock::SearchBudget)) {return here;}
     if t.blocked==Some(TargetBlock::Entrance) {t.waiting_goal}else{t.position}
 }
 
@@ -397,6 +402,27 @@ mod tests {
             assert!(collision::disc_clear(&env.nav,claims[i].position,claims[i].radius));
             for j in i+1..n {assert!(claims[i].position.distance(claims[j].position)+EPS>=claims[i].radius+claims[j].radius+GAP);}
         }
+    }
+    #[test]
+    fn a_temporary_contact_stop_keeps_the_command_route_open() {
+        let mut w=world(40,30);
+        let a=w.spawn(Unit{idx:0,cell_x:5.0,cell_y:12.0,..default()}).id();
+        let b=w.spawn(Unit{idx:1,cell_x:12.0,cell_y:12.0,..default()}).id();
+        w.spawn(Unit{idx:2,cell_x:18.0,cell_y:18.0,..default()});
+        assert_eq!(play::issue_orders_at(&mut w,&[(vec![a,b],Cell::new(28,12))])[0].accepted,2);
+        w.get_mut::<Unit>(b).unwrap().contact_hold=true;
+        let mut units:Vec<_>=w.query::<&Unit>().iter(&w).cloned().collect();units.sort_by_key(|u|u.idx);
+        let command=units[1].command_id;
+        let env=&mut *w.resource_mut::<SimEnv>();maintain(env,&mut units);
+        let mut query=crate::local_nav::Query{grid:&env.nav,bodies:&env.buffers.idle_bodies,
+            index:&mut env.buffers.idle_index,neighbors:&mut env.buffers.idle_neighbors,
+            owner:0,radius:0.45,max_radius:0.45};
+        assert!(query.clear(Vec2::new(10.0,12.0),Vec2::new(14.0,12.0),true),
+            "an active contact stop became a persistent local-route wall");
+        assert!(!query.clear(Vec2::new(16.0,18.0),Vec2::new(20.0,18.0),true),
+            "a genuinely idle body must remain a physical route obstacle");
+        assert_eq!(units[1].command_id,command);assert!(units[1].parking.as_ref().unwrap().valid);
+        assert!(units[1].contact_hold);assert!(!units[1].arrival.held());
     }
     #[test]
     fn simultaneous_swaps_reserve_departing_occupants_and_preserve_spatial_order() {

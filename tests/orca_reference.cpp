@@ -41,6 +41,21 @@ int main() {
             std::cout << "pair," << id << ',' << normal.x() << ',' << normal.y() << ',' << normal*line.point << ','
                 << sim.getAgentVelocity(0).x() << ',' << sim.getAgentVelocity(0).y() << ','
                 << sim.getAgentVelocity(1).x() << ',' << sim.getAgentVelocity(1).y() << '\n';
+        } else if (kind=="obstacle") {
+            float horizon,dt,x,y,vx,vy,r,cap,px,py;unsigned polygons;
+            in >> horizon >> dt >> x >> y >> vx >> vy >> r >> cap >> px >> py >> polygons;
+            RVO::RVOSimulator sim;sim.setTimeStep(dt);
+            for (unsigned i=0;i<polygons;++i) {
+                unsigned n;in >> n;std::vector<RVO::Vector2> p;
+                for (unsigned j=0;j<n;++j) {float a,b;in >> a >> b;p.push_back(RVO::Vector2(a,b));}
+                sim.addObstacle(p);
+            }
+            if (!in) return 5;
+            sim.processObstacles();
+            sim.addAgent(RVO::Vector2(x,y),100.0f,0,horizon,horizon,r,cap,RVO::Vector2(vx,vy));
+            sim.setAgentPrefVelocity(0,RVO::Vector2(px,py));sim.doStep();
+            std::cout << "obstacle," << id << ',' << sim.getAgentNumORCALines(0) << ','
+                << sim.getAgentVelocity(0).x() << ',' << sim.getAgentVelocity(0).y() << '\n';
         } else return 4;
     }
 }

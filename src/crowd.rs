@@ -15,8 +15,93 @@
 //!      **绝不进 A*/流场的代价** —— 进了就会让箭头每帧翻转，单位原地抽搐。
 //!
 //! 速度提议交给 `collision` 执行带半径扫掠、接触约束与轨迹检查，再写回正式位置。
+//! 正式连续模拟使用下述 ORCA 管线；旧分离力/压力函数只用于显式 Legacy 对照。
 
 use crate::nav::CostGrid;
+
+/// Legacy is an explicit historical comparison. Production continuous motion uses ORCA.
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub enum VelocityMode {Legacy,#[default] Orca}
+pub const AGENT_HORIZON:f32=2.0;
+/// Members of the same ordered formation replan/brake together near their slots.
+/// A shorter, symmetric pair horizon avoids projecting their march beyond those slots.
+pub const FORMATION_HORIZON:f64=0.5;
+pub const OBSTACLE_HORIZON:f64=2.0;
+#[derive(Clone,Debug,Default)]
+pub struct OrcaReport {
+    pub solved:usize,pub infeasible:usize,pub invalid:usize,pub emergency:usize,
+    pub static_constraints:usize,pub unit_constraints:usize,pub full_responsibility:usize,
+    pub truncated:usize,pub contact_fallback:usize,pub max_violation:f64,
+}
+#[derive(Default)]
+pub struct OrcaWorkspace {
+    pub boundaries:crate::orca_obstacles::Boundaries,
+    solver:crate::orca::Solver,planes:Vec<crate::orca::HalfPlane>,
+}
+impl OrcaWorkspace {
+    pub fn velocity(&mut self,i:usize,agents:&[Agent],neighbors:&[usize],preferred:bevy::math::Vec2,
+        cap:f32,dt:f32,report:&mut OrcaReport)->bevy::math::Vec2 {
+        self.velocity_with_barrier(i,agents,neighbors,preferred,cap,dt,report,None)
+    }
+    pub fn velocity_with_barrier(&mut self,i:usize,agents:&[Agent],neighbors:&[usize],preferred:bevy::math::Vec2,
+        cap:f32,dt:f32,report:&mut OrcaReport,barrier:Option<crate::orca::HalfPlane>)->bevy::math::Vec2 {
+        use crate::orca::{self,Responsibility,SolveStatus};
+        use bevy::math::DVec2;
+        let a=agents[i];let me=orca::Agent{id:i as u64,position:DVec2::new(a.x as f64,a.y as f64),
+            velocity:DVec2::new(a.vx as f64,a.vy as f64),radius:a.radius as f64};
+        self.planes.clear();
+        if self.boundaries.constraints(me.position,me.velocity,me.radius,a.speed as f64,OBSTACLE_HORIZON,&mut self.planes).is_err() {
+            report.invalid+=1;return bevy::math::Vec2::ZERO;
+        }
+        if let Some(plane)=barrier {self.planes.push(plane);}
+        let hard=self.planes.len();report.static_constraints+=hard;
+        for &j in neighbors {if j==i {continue;}let b=agents[j];
+            let other=orca::Agent{id:j as u64,position:DVec2::new(b.x as f64,b.y as f64),
+                velocity:if b.settled {DVec2::ZERO}else{DVec2::new(b.vx as f64,b.vy as f64)},radius:b.radius as f64};
+            let share=if b.settled {report.full_responsibility+=1;Responsibility::Full}else{Responsibility::Reciprocal};
+            let horizon=if a.group.is_some()&&a.group==b.group {FORMATION_HORIZON}else{AGENT_HORIZON as f64};
+            match orca::unit_constraint(me,other,share,horizon,dt as f64) {
+                Ok(c)=>{self.planes.push(c.plane);report.unit_constraints+=1;},
+                Err(_)=>{report.invalid+=1;return bevy::math::Vec2::ZERO;}
+            }
+        }
+        let result=self.solver.solve(&self.planes,preferred.as_dvec2(),cap as f64,hard);report.solved+=1;
+        report.max_violation=report.max_violation.max(result.max_violation);
+        match result.status {SolveStatus::Feasible=>{},SolveStatus::Infeasible{..}=>report.infeasible+=1,
+            SolveStatus::InvalidInput{..}|SolveStatus::NumericalFailure=>report.invalid+=1}
+        if result.velocity.distance(me.velocity)>a.max_accel as f64*dt as f64+1e-6 {report.emergency+=1;}
+        // No force, turn-rate limit, acceleration clipping or braking after this solve.
+        result.velocity.as_vec2()
+    }
+}
+
+pub fn smooth_preferred(previous:Option<bevy::math::Vec2>,wanted:bevy::math::Vec2,accel:f32,dt:f32,cap:f32)->bevy::math::Vec2 {
+    let objective=previous.map_or(wanted,|old|old+(wanted-old).clamp_length_max(accel*dt));
+    objective.clamp_length_max(cap)
+}
+
+/// A consistent passing-side objective breaks exact cutoff-circle symmetry.
+/// Equal parallel objectives have zero relative velocity and are left alone.
+/// This is a preference only: walls and every agent constraint still participate.
+pub fn passing_preference(i:usize,agents:&[Agent],neighbors:&[usize],wanted:&[bevy::math::Vec2])->bevy::math::Vec2 {
+    passing_preference_unfolding(i,agents,neighbors,wanted,false)
+}
+pub fn passing_preference_unfolding(i:usize,agents:&[Agent],neighbors:&[usize],wanted:&[bevy::math::Vec2],unfolding:bool)->bevy::math::Vec2 {
+    use bevy::math::Vec2;
+    let a=agents[i];let v=wanted[i];let cap=v.length();if cap==0.0 {return v;}
+    let mut closest=AGENT_HORIZON;let mut side=Vec2::ZERO;
+    for &j in neighbors {if i==j {continue;}let b=agents[j];let p=Vec2::new(b.x-a.x,b.y-a.y);
+        if !unfolding&&a.group.is_some()&&a.group==b.group {continue;}
+        let relative=v-wanted[j];let speed_sq=relative.length_squared();
+        if speed_sq<1e-8||v.dot(p)<=0.0 {continue;}
+        let t=p.dot(relative)/speed_sq;
+        if t<=0.0||t>=closest {continue;}
+        let r=a.radius+b.radius;
+        if (p-relative*t).length_squared()>=r*r {continue;}
+        closest=t;side=Vec2::new(p.y,-p.x).normalize_or_zero();
+    }
+    (v+side*(cap*0.15)).clamp_length_max(cap)
+}
 
 /// 一个 agent 的快照（每 tick 建一次，供邻居查询用）。
 #[derive(Clone, Copy, Debug)]

@@ -373,6 +373,12 @@ pub struct Unit {
     pub parking: Option<crate::formation::Target>,
     pub contact_hold: bool,
     pub arrival: crate::arrival::Arrival,
+    /// Smoothed objective, never a post-solve acceleration limit.
+    pub preferred_velocity: Option<bevy::math::Vec2>,
+    pub traffic_phase:crate::traffic::Phase,
+    pub traffic_hold:bool,
+    pub recovery_phase:crate::recovery::Phase,
+    pub no_progress_seconds:f64,
 
     pub on_ground: bool,
     /// 位置（格单位）。上游 onGround 实体用 (cellX,cellY)、非地面用 (x,y)；这里统一成格坐标。
@@ -437,6 +443,11 @@ impl Default for Unit {
             parking: None,
             contact_hold: false,
             arrival: crate::arrival::Arrival::default(),
+            preferred_velocity: None,
+            traffic_phase:crate::traffic::Phase::Free,
+            traffic_hold:false,
+            recovery_phase:crate::recovery::Phase::Monitoring,
+            no_progress_seconds:0.0,
             on_ground: true,
             cell_x: 0.0,
             cell_y: 0.0,
@@ -488,6 +499,9 @@ pub struct SimEnv {
     // ---- 连续运动层（路线 C）------------------------------------------------
     /// true = 走 `update_sim_crowd`（互斥力 + 路权 + 压力场），false = 走旧的离散重力碗
     pub use_crowd: bool,
+    pub velocity_mode: crowd::VelocityMode,
+    pub traffic:crate::traffic::Traffic,
+    pub recovery:crate::recovery::Recovery,
     /// 拥挤度压力场（低频重建）
     pub pressure: crowd::Pressure,
     pub crowd_params: crowd::Params,
@@ -507,6 +521,9 @@ impl Default for SimEnv {
             buffers: crate::simulation::Buffers::default(),
             reservations: crate::formation::Reservations::default(),
             use_crowd: true,
+            velocity_mode: crowd::VelocityMode::Orca,
+            traffic:crate::traffic::Traffic::default(),
+            recovery:crate::recovery::Recovery::default(),
             pressure: crowd::Pressure::default(),
             crowd_params: crowd::Params::default(),
             since_pressure: 0,

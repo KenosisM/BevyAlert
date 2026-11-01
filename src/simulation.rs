@@ -1,7 +1,7 @@
 //! Fixed-step continuous simulation shared by ECS and asset-free headless runs.
 //!
 //! Unit and SimEnv are data at this boundary; this module never queries ECS.
-//! Legacy steering proposes motion; collision checks constrain the committed trajectories.
+//! ORCA selects velocities; continuous collision checks verify the committed trajectories.
 
 use std::time::{Duration, Instant};
 use crate::crowd;
@@ -16,7 +16,17 @@ pub struct Buffers {
     pub idle_bodies:Vec<crate::formation::Body>,pub idle_index:crate::spatial::Index,
     pub idle_bounds:Vec<crate::spatial::Aabb>,pub idle_neighbors:Vec<usize>,
     pub local_routes:crate::local_nav::Routes,
+    pub orca:crowd::OrcaWorkspace,
+    proposals:Vec<bevy::math::Vec2>,
+    objectives:Vec<bevy::math::Vec2>,caps:Vec<f32>,
     bounds:Vec<crate::spatial::Aabb>,neighbors:Vec<usize>,
+}
+impl Buffers {
+    /// Last raw request, before passing preference, ORCA and contact verification.
+    pub fn requested_motion(&self,id:i32)->Option<(bevy::math::Vec2,f32)> {
+        let i=self.formation_positions.iter().position(|(owner,_,_)|*owner==id)?;
+        Some((*self.objectives.get(i)?,*self.caps.get(i)?))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +55,8 @@ pub struct PhaseTimes {
     pub total: Duration,
     pub spatial: Duration,
     pub formation: Duration,
+    pub traffic:Duration,
+    pub recovery:Duration,
 }
 
 /// A sampled event, kept in memory. Sampling performs no file or console I/O.
@@ -74,6 +86,7 @@ pub struct Runtime {
     /// Last completed contact check, including conservative stops and unresolved initial overlaps.
     pub contacts: crate::collision::ContactReport,
     pub spatial_stats: crate::spatial::Stats,
+    pub orca:crowd::OrcaReport,
 }
 
 impl Default for Runtime {
@@ -86,7 +99,7 @@ impl Runtime {
         let fixed_step = Duration::from_secs_f64(1.0 / hz);
         assert!(!fixed_step.is_zero(), "simulation timestep must be nonzero");
         Self { fixed_step, seed, next_command: 1, sample_every: 0, last_sample: None,
-            contacts: crate::collision::ContactReport::default(),spatial_stats:crate::spatial::Stats::default() }
+            contacts: crate::collision::ContactReport::default(),spatial_stats:crate::spatial::Stats::default(),orca:crowd::OrcaReport::default() }
     }
     pub fn fixed_step(&self) -> Duration { self.fixed_step }
     pub fn dt(&self) -> f32 { self.fixed_step.as_secs_f32() }
@@ -104,16 +117,37 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
     let total = Instant::now();
     units.sort_by_key(|u| u.idx);
     assert!(units.windows(2).all(|p| p[0].idx != p[1].idx), "duplicate simulation unit ID");
+    env.buffers.local_routes.begin_tick(env.tick);
     crate::formation::maintain(env,units);
     for u in units.iter_mut() {if let Some(t)=&u.parking {
         u.arrival.before(t,bevy::math::Vec2::new(u.cell_x,u.cell_y));
     }}
     let formation_time=total.elapsed();
     let dt = env.runtime.dt();
+    let orca=env.velocity_mode==crowd::VelocityMode::Orca;
+    let traffic_start=Instant::now();
+    if orca {env.traffic.update(&env.nav,units,env.tick,dt,&mut env.buffers.local_routes.budget);}
+    for u in units.iter_mut() {let decision=env.traffic.decision(u.idx);u.traffic_phase=decision.phase;u.traffic_hold=decision.cap==Some(0.0);
+        if decision.freeze_target {if let Some(t)=&mut u.parking {t.frozen=true;}}
+        if decision.phase==crate::traffic::Phase::FinalApproach {if let Some(t)=&mut u.parking {
+            // The complete group already occupies its expanded approach layout.
+            // Deep-row entry dependencies would send aligned owners backwards.
+            t.predecessor=None;if t.blocked==Some(crate::formation::TargetBlock::Entrance) {t.blocked=None;}
+        }}
+    }
+    let traffic_time=traffic_start.elapsed();
+    let recovery_start=Instant::now();
+    if orca {env.recovery.update(&env.nav,units,&env.traffic,env.tick,dt,&mut env.buffers.local_routes.budget);}
+    for &(id,command) in &env.recovery.renewals {if units.binary_search_by_key(&id,|u|u.idx).ok().is_some_and(|i|units[i].command_id.is_some_and(|c|c.0==command)) {
+        env.traffic.request_review(id,command,env.tick);
+    }}
+    let recovery_time=recovery_start.elapsed();
+    env.runtime.orca=crowd::OrcaReport::default();
     let phase = Instant::now();
     // ---- 1. 快照：位置 / 路权 / 半径 ----------------------------------------
     let mut buffers=std::mem::take(&mut env.buffers);
     buffers.velocity_index.begin_tick();buffers.contacts.begin_tick();
+    if orca {buffers.orca.boundaries.refresh(&env.nav);}
     let agents=&mut buffers.agents;agents.clear();agents.reserve(units.len());
     for u in units.iter() {
         // 路权：离自己那一格越近越优先（用场的剩余距离；没有场就用欧氏距离）
@@ -130,7 +164,8 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             _ => 0.0,
         };
         let settled = if let Some(t)=&u.parking {
-            u.arrival.held()||(t.valid&&t.blocked.is_none()&&u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED
+            u.arrival.held()||(!matches!(u.traffic_phase,crate::traffic::Phase::Passing|crate::traffic::Phase::Assembling|crate::traffic::Phase::GivingWay)
+                &&t.valid&&t.blocked.is_none()&&u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED
                 &&crate::formation::position(u).distance(t.position)<=crate::formation::POINT_REACH_RADIUS)
         }else {u.goal.x < 0
             || (u.goal.x >= 0
@@ -143,7 +178,10 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
             speed: u.speed,
             priority: -remaining,
             radius: u.parking.as_ref().map_or(env.crowd_params.radius_default(),|t|t.radius),
-            settled: settled || !u.on_ground,
+            settled: settled || !u.on_ground||env.traffic.decision(u.idx).cap==Some(0.0)
+                ||(u.vx.hypot(u.vy)<=crate::arrival::QUIET_SPEED
+                    &&u.parking.as_ref().is_some_and(|t|matches!(t.blocked,Some(crate::formation::TargetBlock::SearchBudget|crate::formation::TargetBlock::NoLocalPath)))
+                    &&env.recovery.preferred(u.idx,crate::formation::position(u),u.speed,dt).is_none()),
             vx: u.vx,
             vy: u.vy,
             max_accel: u.speed * 6.0,
@@ -152,15 +190,15 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
 
     buffers.bounds.clear();buffers.bounds.extend(agents.iter().map(|a|crate::spatial::Aabb::point(bevy::math::Vec2::new(a.x,a.y))));
     buffers.velocity_index.rebuild(&buffers.bounds);
-    let max_speed=agents.iter().map(|a|a.speed.abs()).fold(0.0f32,f32::max);
+    let max_speed=agents.iter().map(|a|a.speed.abs().max(a.vx.hypot(a.vy))).fold(0.0f32,f32::max);
     let max_radius=agents.iter().map(|a|a.radius).fold(0.0f32,f32::max);
 
     let snapshot_time = phase.elapsed();
     let phase = Instant::now();
 
     // ---- 2. 压力场：每 4 tick 重建一次（低频，避免抖动）--------------------
-    env.since_pressure += 1;
-    if env.since_pressure >= 4 || env.pressure.field.is_empty() {
+    if !orca {env.since_pressure += 1;}
+    if !orca&&(env.since_pressure >= 4 || env.pressure.field.is_empty()) {
         env.pressure.rebuild(&env.nav, &agents);
         env.since_pressure = 0;
     }
@@ -170,28 +208,47 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
 
     // ---- 3. 速度层：算出每辆车的期望速度，把位置先推到快照里 ----------------
     buffers.snapshot.clear();buffers.snapshot.extend_from_slice(agents);let snapshot=&buffers.snapshot;
+    buffers.objectives.clear();buffers.objectives.resize(units.len(),bevy::math::Vec2::ZERO);
+    buffers.caps.clear();buffers.caps.resize(units.len(),0.0);
     let dt_safe = dt.max(1e-4);
     for (i, u) in units.iter_mut().enumerate() {
-        if !u.on_ground || u.goal.x < 0 || agents[i].settled {
+        let waiting_route=!u.arrival.held()&&u.parking.as_ref().is_some_and(|t|matches!(t.blocked,
+            Some(crate::formation::TargetBlock::SearchBudget|crate::formation::TargetBlock::NoLocalPath)))
+            &&env.traffic.decision(u.idx).cap!=Some(0.0);
+        if !u.on_ground || u.goal.x < 0 || (agents[i].settled&&!waiting_route) {
             continue;
         }
         let parking=crate::formation::parking_position(u);let goal=(parking.x,parking.y);
         let mut query=crate::local_nav::Query{grid:&env.nav,bodies:&buffers.idle_bodies,index:&mut buffers.idle_index,
             neighbors:&mut buffers.idle_neighbors,owner:u.idx,radius:agents[i].radius,max_radius};
-        let local=crate::formation::direction(u,bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),env.tick,&mut query,&mut buffers.local_routes);
+        let traffic=env.traffic.decision(u.idx);
+        let controlled=orca&&traffic.point.is_some();
+        let local=if controlled {None}else{crate::formation::direction(u,bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),env.tick,&mut query,&mut buffers.local_routes)};
         let mut dir = if let Some(v)=local {(v.x,v.y)}else{long_range_dir(&env.nav,u,&snapshot[i],goal)};
+        if controlled {if let Some(point)=traffic.point {
+            let here=bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y);
+            let v=env.traffic.assembly_direction(u.idx,u.command_id.map_or(0,|c|c.0),here,env.tick,&mut query,&mut buffers.local_routes).unwrap_or_else(||(point-here).normalize_or_zero());dir=(v.x,v.y);
+        }}
+        let recovery=if orca {env.recovery.preferred(u.idx,bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),u.speed,dt)}else{None};
+        if let Some((v,_))=recovery {dir=(v.x,v.y);}
         // 保留原有切向逃逸，直到显式停滞恢复接管。
-        if u.escape_ticks > 0&&!u.parking.as_ref().is_some_and(|t|t.local_active) {
+        if !orca&&u.escape_ticks > 0&&!u.parking.as_ref().is_some_and(|t|t.local_active) {
             dir = crowd::rotate90(dir, u.escape_side);
         }
-        let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,
-            dt,env.crowd_params.neighbor_radius.max(1.2));
-        buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
+        if !orca {
+            let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,dt,env.crowd_params.neighbor_radius.max(1.2));
+            buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
+        }
         let goal=crate::formation::motion_goal(u);let goal=(goal.x,goal.y);
-        let preferred=if let Some(t)=&u.parking {
+        let preferred=if let Some((_,cap))=recovery {Some(cap)}else if controlled {Some(u.speed)}else if let Some(t)=&u.parking {
             let remaining=t.remaining_distance(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),bevy::math::Vec2::new(goal.0,goal.1));
             Some(u.arrival.preferred_speed(t,remaining,u.speed,agents[i].max_accel,dt))
         }else{None};
+        if orca {
+            let cap=preferred.unwrap_or(u.speed).min(u.speed).min(traffic.cap.unwrap_or(u.speed)).max(0.0);
+            buffers.objectives[i]=bevy::math::Vec2::new(dir.0,dir.1).normalize_or_zero()*cap;
+            buffers.caps[i]=cap;continue;
+        }
         let mut steering_params=env.crowd_params;
         if u.parking.is_some() {
             steering_params.arrive_radius=crate::formation::POINT_REACH_RADIUS;
@@ -216,15 +273,34 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         agents[i].x = from.0+vx*dt;
         agents[i].y = from.1+vy*dt;
     }
+    if orca {for (i,u) in units.iter_mut().enumerate() {
+        if !u.on_ground||u.goal.x<0||snapshot[i].settled {continue;}
+        let range=crate::spatial::neighbor_range(snapshot[i].speed,snapshot[i].radius,max_speed,max_radius,
+            crowd::AGENT_HORIZON,env.crowd_params.neighbor_radius.max(1.2));
+        buffers.velocity_index.query_radius(bevy::math::Vec2::new(snapshot[i].x,snapshot[i].y),range,&mut buffers.neighbors);
+        let wanted=crowd::passing_preference_unfolding(i,snapshot,&buffers.neighbors,&buffers.objectives,matches!(u.traffic_phase,crate::traffic::Phase::Assembling|crate::traffic::Phase::GivingWay));
+        let accel=if u.traffic_phase==crate::traffic::Phase::FinalApproach {snapshot[i].max_accel*(buffers.caps[i]/snapshot[i].speed.max(0.001)).min(1.0)}else{snapshot[i].max_accel};
+        let objective=crowd::smooth_preferred(u.preferred_velocity,wanted,accel,dt,buffers.caps[i]);
+        u.preferred_velocity=Some(objective);
+        let v=buffers.orca.velocity_with_barrier(i,snapshot,&buffers.neighbors,objective,buffers.caps[i],dt,&mut env.runtime.orca,env.traffic.decision(u.idx).barrier);
+        agents[i].x=snapshot[i].x+v.x*dt;agents[i].y=snapshot[i].y+v.y*dt;
+    }}
 
+    env.recovery.report.expanded=buffers.local_routes.budget.expanded;
+    env.recovery.report.budget_pending=buffers.local_routes.budget.pending();
     let velocity_time = phase.elapsed();
     let phase = Instant::now();
 
-    // ---- 4. 位置修正层：把重叠的圆盘直接推开 --------------------------------
-    // 速度层只能把稳态压到「软重叠」——期望速度一直在往里顶。这一层是硬约束。
+    // ---- 4. Verify whole trajectories; keep contact correction as a reported fallback.
+    buffers.proposals.clear();buffers.proposals.extend(agents.iter().map(|a|bevy::math::Vec2::new(a.x,a.y)));
     crate::collision::finish_motion_with_workspace(snapshot,agents,&env.nav,&mut buffers.contacts,&mut env.runtime.contacts);
+    if orca {env.runtime.orca.contact_fallback=agents.iter().zip(&buffers.proposals).enumerate()
+        .filter(|(i,(a,p))|env.runtime.contacts.reasons[*i]!=crate::collision::Blocked::None
+            ||bevy::math::Vec2::new(a.x,a.y).distance_squared(**p)>1e-8).count();}
     let mut spatial_stats=buffers.velocity_index.stats.clone();
     spatial_stats.merge(&buffers.idle_index.stats);
+    if orca {spatial_stats.merge(&buffers.orca.boundaries.index.stats);}
+    env.runtime.orca.truncated=spatial_stats.truncated;
     spatial_stats.merge(&buffers.contacts.projection_index.stats);spatial_stats.merge(&buffers.contacts.trajectory_index.stats);
     env.runtime.spatial_stats=spatial_stats;
 
@@ -255,7 +331,8 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         u.vx = dx / dt_safe;
         u.vy = dy / dt_safe;
         u.contact_hold=env.runtime.contacts.reasons[i]==crate::collision::Blocked::SafetyStop;
-        if let Some(t)=&u.parking {u.arrival.observe(t,bevy::math::Vec2::new(u.cell_x,u.cell_y),u.vx.hypot(u.vy),env.runtime.fixed_step().as_secs_f64());}
+        if matches!(u.traffic_phase,crate::traffic::Phase::Passing|crate::traffic::Phase::Assembling|crate::traffic::Phase::GivingWay) {u.arrival.quiet_seconds=0.0;}
+        else if let Some(t)=&u.parking {u.arrival.observe(t,bevy::math::Vec2::new(u.cell_x,u.cell_y),u.vx.hypot(u.vy),env.runtime.fixed_step().as_secs_f64());}
         u.path.clear();
         u.leg_t = 0.0;
 
@@ -275,7 +352,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         if u.escape_ticks > 0 {
             u.escape_ticks -= 1;
         }
-        if u.stall_ticks > 30 && u.escape_ticks == 0 {
+        if !orca&&u.stall_ticks > 30 && u.escape_ticks == 0 {
             u.escape_ticks = 20;
             u.escape_side = if (u.idx % 2) == 0 { 1.0 } else { -1.0 };
             u.stall_ticks = 0;
@@ -316,7 +393,7 @@ pub fn step_continuous(env: &mut SimEnv, units: &mut [Unit]) {
         let times = PhaseTimes { snapshot: snapshot_time, pressure: pressure_time,
             velocity: velocity_time, contact: contact_time, writeback: phase.elapsed(),
             total: total.elapsed(),spatial:env.runtime.spatial_stats.build_time+env.runtime.spatial_stats.query_time,
-            formation:formation_time };
+            formation:formation_time,traffic:traffic_time,recovery:recovery_time };
         env.runtime.last_sample = Some(TickSample {
             tick: env.tick, seed: env.runtime.seed,
             units: units.iter().map(|u| UnitSample {

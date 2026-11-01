@@ -14,6 +14,7 @@ struct DemoState {
     config:SceneConfig, run:RunOptions, paused:bool, single_step:bool,
     latest:Metrics, samples:Vec<Metrics>, frames:u32, frame_seconds:f32, fps:f32,
     render_frames:u64,capture_requested:bool,capture_finished:bool,
+    parked_since:Option<u64>,
 }
 
 #[derive(Resource,Clone)]
@@ -22,6 +23,8 @@ struct Graphics { circle:Handle<Mesh>, materials:Vec<Handle<ColorMaterial>> }
 struct Hud;
 #[derive(Component)]
 struct GoalMarker;
+#[derive(Component)]
+struct NavBlock;
 
 pub fn run(args:&[String]) -> Result<(),String> {
     let (config,options)=nav_scenario::parse_args(args)?;
@@ -37,7 +40,7 @@ pub fn run(args:&[String]) -> Result<(),String> {
     }));
     app.insert_resource(ClearColor(Color::srgb(0.025,0.035,0.05)));
     app.insert_resource(DemoState { config,run:options,paused,single_step:false,latest:Metrics::default(),
-        samples:Vec::new(),frames:0,frame_seconds:0.0,fps:0.0,render_frames:0,capture_requested:false,capture_finished:false });
+        samples:Vec::new(),frames:0,frame_seconds:0.0,fps:0.0,render_frames:0,capture_requested:false,capture_finished:false,parked_since:None });
     app.add_systems(Startup,setup);
     add_fixed_systems(&mut app);
     app.add_systems(Update,(input,update_positions,update_hud,capture_frame).chain());
@@ -96,14 +99,20 @@ fn reset(world:&mut World) {
         world.entity_mut(entity).insert((Mesh2d(graphics.circle.clone()),MeshMaterial2d(graphics.materials[group].clone()),
             Transform::from_translation(position(x,y,1.0))));
     }
-    let markers:Vec<_>=world.query_filtered::<Entity,With<GoalMarker>>().iter(world).collect();
+    let markers:Vec<_>=world.query_filtered::<Entity,Or<(With<GoalMarker>,With<NavBlock>)>>().iter(world).collect();
     for e in markers { world.despawn(e); }
+    let grid=world.resource::<SimEnv>().nav.clone();
+    for y in 0..grid.h {let mut x=0;while x<grid.w {if grid.walkable(x,y) {x+=1;continue;}let first=x;
+        while x<grid.w&&!grid.walkable(x,y) {x+=1;}
+        world.spawn((NavBlock,Sprite::from_color(Color::srgb(0.3,0.34,0.4),Vec2::new((x-first) as f32*SCALE,SCALE)),
+            Transform::from_translation(position((first+x-1) as f32*0.5,y as f32,-1.0))));
+    }}
     for (group,(_,goal)) in config.kind.routes().iter().enumerate() {
         world.spawn((GoalMarker,Sprite::from_color(COLORS[group].with_alpha(0.25),Vec2::splat(9.0)),
             Transform::from_translation(position(goal.x as f32,goal.y as f32,0.0))));
     }
     let initial=nav_scenario::metrics(world);
-    let mut state=world.resource_mut::<DemoState>();state.single_step=false;state.latest=initial.clone();state.samples=vec![initial];
+    let mut state=world.resource_mut::<DemoState>();state.single_step=false;state.latest=initial.clone();state.samples=vec![initial];state.parked_since=None;
     println!("event=reset scene={} per_group={} seed={} jitter={} tick=0 digest={:016x}",
         config.kind.name(),config.per_group,config.seed,config.jitter,state.latest.digest);
 }
@@ -112,12 +121,15 @@ fn can_step(state:Res<DemoState>)->bool { !state.paused||state.single_step }
 
 fn observe_tick(world:&mut World) {
     let tick=world.resource::<SimEnv>().tick;
+    let parked=nav_scenario::all_parked(world);
+    {let mut s=world.resource_mut::<DemoState>();if parked {s.parked_since.get_or_insert(tick);}else{s.parked_since=None;}}
     let sample={let s=world.resource::<DemoState>();tick%s.config.sample_every==0||s.single_step};
     if sample {
         let m=nav_scenario::metrics(world);
         let mut state=world.resource_mut::<DemoState>();state.latest=m.clone();state.samples.push(m);
     }
-    let (single,exit)={let s=world.resource::<DemoState>();(s.single_step,s.run.exit_after_ticks.is_some_and(|t|tick>=t))};
+    let (single,exit)={let s=world.resource::<DemoState>();(s.single_step,s.run.exit_after_ticks.is_some_and(|t|tick>=t)
+        ||s.run.stop_after_parked.is_some_and(|hold|s.parked_since.is_some_and(|since|tick-since>=hold)))};
     if single { println!("event=single-step tick={tick} digest={:016x}",world.resource::<DemoState>().latest.digest); }
     world.resource_mut::<DemoState>().single_step=false;
     if exit {
@@ -149,7 +161,8 @@ fn input(world:&mut World) {
     let count=if keys.just_pressed(KeyCode::Digit1) {Some(64)} else if keys.just_pressed(KeyCode::Digit2) {Some(256)}
         else if keys.just_pressed(KeyCode::Digit3) {Some(1024)} else {None};
     let kind=if keys.just_pressed(KeyCode::F1) {Some(SceneKind::Crossing)} else if keys.just_pressed(KeyCode::F2) {Some(SceneKind::HeadOn)}
-        else if keys.just_pressed(KeyCode::F3) {Some(SceneKind::Single)} else {None};
+        else if keys.just_pressed(KeyCode::F3) {Some(SceneKind::Single)} else if keys.just_pressed(KeyCode::F4) {Some(SceneKind::SingleObstacle)}
+        else if keys.just_pressed(KeyCode::F5) {Some(SceneKind::SingleWidth)} else {None};
     let mode=keys.just_pressed(KeyCode::Tab);
     {
         let mut state=world.resource_mut::<DemoState>();
@@ -185,7 +198,7 @@ fn update_hud(time:Res<Time>,env:Res<SimEnv>,mut state:ResMut<DemoState>,mut tex
     let fps=if state.fps>0.0 {format!("{:.1} FPS",state.fps)} else {"warming up".into()};
     if let Ok(mut text)=text.single_mut() {
         text.0=format!("Navigation | {} | {} | {} | {} units | seed {} jitter {} | tick {} | {}\n\
-            Space pause | N step | R reset | 1/2/3=64/256/1024 | F1 cross F2 head-on F3 single | Tab mode | S save | H stop U resume X cancel | Esc close\n\
+            Space pause | N step | R reset | 1/2/3=64/256/1024 | F1 cross F2 head-on F3 single F4 wall F5 width | Tab mode | S save | H stop U resume X cancel | Esc close\n\
             A red  B blue  C green  D gold | commands active {} | moving {} | legacy stalls {} | max still {:.2}s\n\
             Arrived {} | approaching {} | stopped {} | replanning {} | failed {} | drift {:.4} | sample tick {} | overlap(end) {:.4} | core {}\n\
             Reserved {} | frozen {} | space wait {} | entrance wait {} | blocked local path {} | digest {:016x}",
@@ -203,7 +216,7 @@ mod tests {
         let mut app=App::new();let (config,mut run)=nav_scenario::parse_args(&[]).unwrap();run.paused=true;
         app.insert_resource(Assets::<Mesh>::default());app.insert_resource(Assets::<ColorMaterial>::default());
         app.insert_resource(DemoState {config,run,paused:true,single_step:false,latest:Metrics::default(),samples:Vec::new(),
-            frames:0,frame_seconds:0.0,fps:0.0,render_frames:0,capture_requested:false,capture_finished:false});
+            frames:0,frame_seconds:0.0,fps:0.0,render_frames:0,capture_requested:false,capture_finished:false,parked_since:None});
         add_fixed_systems(&mut app);setup(app.world_mut());app
     }
     fn press(app:&mut App,key:KeyCode) {

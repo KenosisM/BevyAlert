@@ -7,7 +7,7 @@
 //! 上述来源保留初始移植背景；当前导航包含明确的正确性修正。
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BTreeMap,BTreeSet,BinaryHeap, VecDeque};
 
 // ============================================================================ 基本类型
 
@@ -269,85 +269,127 @@ pub fn find_path_extra(
 /// Additional physical edge constraints supplement, never bypass, the shared nav edge.
 pub fn find_path_filtered(g:&CostGrid,from:Cell,to:Cell,extra_blocked:&dyn Fn(i32,i32)->bool,
     budget:i32,edge_allowed:&mut dyn FnMut(Cell,Cell)->bool)->PathResult {
-    // 上游 `PathResult::expanded` 从头到尾没被赋值（恒 0），这里照抄不写。
-    let mut out = PathResult {
-        cells: Vec::new(),
-        expanded: 0,
-        found: false,
-    };
-    if !g.valid() || !g.in_(from.x, from.y) || !g.in_(to.x, to.y) {
-        return out;
+    let mut search=PathSearch::new(g,from,to);
+    search.advance(g,if budget<0 {usize::MAX}else{budget as usize},extra_blocked,
+        &mut |a,b|edge_allowed(a,b).then_some(0.0));
+    // Retain the original API's expanded=0 observation; resumable callers use
+    // PathSearch::expanded and distinguish Pending from an exhausted graph.
+    PathResult{found:search.status==SearchStatus::Found,cells:search.cells,expanded:0}
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum SearchStatus {Pending,Found,NoPath,Invalid}
+#[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)]
+pub struct SearchKey {pub command:u64,pub owner:i32,pub x:u32,pub y:u32,pub class:u8}
+struct RequestAge {first:u64,seen:u64,served:u64,after:u64}
+/// A single fair expansion coordinator, shared by near parking and recovery.
+#[derive(Default)]
+pub struct ReplanBudget {tick:u64,begun:bool,requests:BTreeMap<SearchKey,RequestAge>,grants:BTreeSet<SearchKey>,used:BTreeSet<SearchKey>,pub expanded:usize}
+impl ReplanBudget {
+    pub const LIMIT:usize=512;
+    pub const SLICE:usize=64;
+    pub fn begin(&mut self,tick:u64) {
+        if self.begun&&self.tick==tick {return;}
+        self.begun=true;self.tick=tick;self.expanded=0;self.used.clear();self.grants.clear();
+        self.requests.retain(|_,r|r.seen.saturating_add(1)>=tick);
+        let mut order:Vec<_>=self.requests.iter().filter(|(_,r)|r.after<=tick).map(|(&k,r)|(r.served,r.first,k)).collect();
+        order.sort();self.grants.extend(order.into_iter().take(Self::LIMIT/Self::SLICE).map(|r|r.2));
     }
-    if !g.walkable(from.x, from.y) || !g.walkable(to.x, to.y) {
-        return out;
+    pub fn request(&mut self,key:SearchKey,tick:u64)->usize {
+        self.requests.entry(key).and_modify(|r|r.seen=tick).or_insert(RequestAge{first:tick,seen:tick,served:tick,after:tick});
+        if self.grants.contains(&key)&&self.used.insert(key) {self.requests.get_mut(&key).unwrap().served=tick.saturating_add(1);Self::SLICE}else{0}
     }
-    if extra_blocked(from.x, from.y) || extra_blocked(to.x, to.y) {
-        return out;
+    pub fn record(&mut self,count:usize) {self.expanded+=count;assert!(self.expanded<=Self::LIMIT,"replan expansion budget exceeded");}
+    pub fn finish(&mut self,key:SearchKey,success:bool,cooldown:u64) {
+        if success {self.requests.remove(&key);}else if let Some(r)=self.requests.get_mut(&key) {r.after=self.tick.saturating_add(cooldown);}
     }
-
-    let n = (g.w as usize) * (g.h as usize);
-    let idx = |x: i32, y: i32| (y as usize) * (g.w as usize) + (x as usize);
-
-    let mut g_score = vec![1e30f32; n];
-    let mut came = vec![-1i32; n];
-    let mut closed = vec![0u8; n];
-
-    let mut open: BinaryHeap<Node> = BinaryHeap::new();
-
-    let start = idx(from.x, from.y) as i32;
-    let goal = idx(to.x, to.y) as i32;
-    g_score[start as usize] = 0.0;
-    open.push(Node {
-        f: octile(to.x - from.x, to.y - from.y),
-        i: start,
-    });
-
-    let mut expanded = 0i32;
-    while let Some(cur) = open.pop() {
-        if closed[cur.i as usize] != 0 {
-            continue;
+    pub fn pending(&self)->usize {self.requests.len()}
+}
+/// One shared A* implementation for immediate and fairly sliced requests.
+/// Additional nonnegative costs represent temporary reservations, not walls.
+pub struct PathSearch {
+    pub status:SearchStatus,pub cells:Vec<Cell>,pub expanded:usize,
+    w:i32,h:i32,start:Cell,goal:Cell,goals:Vec<Cell>,scores:Vec<f32>,came:Vec<i32>,closed:Vec<bool>,open:BinaryHeap<Node>,
+}
+impl PathSearch {
+    pub fn new(g:&CostGrid,start:Cell,goal:Cell)->Self {
+        let valid=g.valid()&&g.walkable(start.x,start.y)&&g.walkable(goal.x,goal.y);
+        let n=if valid {g.cost.len()}else{0};let mut result=Self{status:if valid {SearchStatus::Pending}else{SearchStatus::Invalid},
+            cells:Vec::new(),expanded:0,w:g.w,h:g.h,start,goal,goals:vec![goal],scores:vec![1e30;n],came:vec![-1;n],closed:vec![false;n],open:BinaryHeap::new()};
+        if valid {let i=start.y*g.w+start.x;result.scores[i as usize]=0.0;result.open.push(Node{f:octile(goal.x-start.x,goal.y-start.y),i});}
+        result
+    }
+    pub fn multi(g:&CostGrid,starts:&[Cell],goals:&[Cell])->Self {
+        let mut result=Self::new(g,starts.first().copied().unwrap_or(Cell::new(-1,-1)),goals.first().copied().unwrap_or(Cell::new(-1,-1)));
+        if starts.iter().chain(goals).any(|c|!g.walkable(c.x,c.y)) {result.status=SearchStatus::Invalid;return result;}
+        if result.status==SearchStatus::Invalid {return result;}result.goals=goals.to_vec();result.open.clear();result.scores.fill(1e30);
+        for &start in starts {let i=(start.y*g.w+start.x) as usize;result.scores[i]=0.0;
+            let f=goals.iter().map(|goal|octile(goal.x-start.x,goal.y-start.y)).fold(f32::INFINITY,f32::min);result.open.push(Node{f,i:i as i32});}
+        result
+    }
+    pub fn advance(&mut self,g:&CostGrid,budget:usize,blocked:&dyn Fn(i32,i32)->bool,
+        edge:&mut dyn FnMut(Cell,Cell)->Option<f32>)->SearchStatus {
+        if self.status!=SearchStatus::Pending {return self.status;}
+        if !g.valid()||g.w!=self.w||g.h!=self.h||blocked(self.start.x,self.start.y)||blocked(self.goal.x,self.goal.y) {
+            self.status=SearchStatus::Invalid;return self.status;
         }
-        closed[cur.i as usize] = 1;
-        expanded += 1;
-        if budget >= 0 && expanded > budget {
-            break;
-        }
-        if cur.i == goal {
-            out.found = true;
-            let mut i = cur.i;
-            while i != -1 {
-                out.cells.push(Cell {
-                    x: i % g.w,
-                    y: i / g.w,
-                });
-                i = came[i as usize];
+        let mut used=0;
+        while used<budget {
+            let Some(cur)=self.open.pop() else{self.status=SearchStatus::NoPath;break;};
+            if self.closed[cur.i as usize] {continue;}
+            self.closed[cur.i as usize]=true;self.expanded+=1;used+=1;
+            let cell=Cell::new(cur.i%g.w,cur.i/g.w);
+            if self.goals.contains(&cell) {let mut i=cur.i;while i!=-1 {self.cells.push(Cell::new(i%g.w,i/g.w));i=self.came[i as usize];}
+                self.cells.reverse();self.status=SearchStatus::Found;break;
             }
-            out.cells.reverse();
-            return out;
-        }
-        let cx = cur.i % g.w;
-        let cy = cur.i / g.w;
-        for d in 0..8 {
-            let nx = cx + K_DIR_X[d];
-            let ny = cy + K_DIR_Y[d];
-            let Some(step)=step_cost_extra(g,Cell::new(cx,cy),Cell::new(nx,ny),extra_blocked) else {continue;};
-            if !edge_allowed(Cell::new(cx,cy),Cell::new(nx,ny)) {continue;}
-            let ni = idx(nx, ny) as i32;
-            if closed[ni as usize] != 0 {
-                continue;
-            }
-            let tentative = g_score[cur.i as usize] + step;
-            if tentative < g_score[ni as usize] {
-                g_score[ni as usize] = tentative;
-                came[ni as usize] = cur.i;
-                open.push(Node {
-                    f: tentative + octile(to.x - nx, to.y - ny),
-                    i: ni,
-                });
+            for d in 0..8 {
+                let next=Cell::new(cell.x+K_DIR_X[d],cell.y+K_DIR_Y[d]);
+                let Some(cost)=step_cost_extra(g,cell,next,blocked) else{continue;};
+                let ni=(next.y*g.w+next.x) as usize;if self.closed[ni] {continue;}
+                let Some(extra)=edge(cell,next).filter(|v|v.is_finite()&&*v>=0.0) else{continue;};
+                let score=self.scores[cur.i as usize]+cost+extra;
+                if score<self.scores[ni] {self.scores[ni]=score;self.came[ni]=cur.i;
+                    let heuristic=self.goals.iter().map(|goal|octile(goal.x-next.x,goal.y-next.y)).fold(f32::INFINITY,f32::min);
+                    self.open.push(Node{f:score+heuristic,i:ni as i32});}
             }
         }
+        self.status
     }
-    out
+}
+
+#[cfg(test)]
+mod sliced_search_tests {
+    use super::*;
+    #[test]
+    fn one_shared_budget_services_all_classes_without_duplicate_grants() {
+        let mut budget=ReplanBudget::default();let keys:Vec<_>=(0..24).map(|id|SearchKey{owner:id,command:1+(id%3) as u64,x:0,y:0,class:(id%3) as u8}).collect();
+        let mut served=vec![0;keys.len()];
+        for tick in 0..12 {budget.begin(tick);
+            for (i,&key) in keys.iter().enumerate() {let n=budget.request(key,tick);assert_eq!(budget.request(key,tick),0);
+                if n>0 {served[i]+=1;budget.record(n);}}
+            assert!(budget.expanded<=512);
+        }
+        assert!(served.iter().all(|n|*n>=3),"some class or owner starved: {served:?}");
+    }
+    #[test]
+    fn exhausted_budget_is_pending_and_can_resume_to_a_weighted_detour() {
+        let mut g=CostGrid{w:24,h:16,cost:vec![1;24*16],..Default::default()};
+        for y in 0..13 {g.cost[y*24+12]=0;}
+        let mut search=PathSearch::new(&g,Cell::new(3,5),Cell::new(20,5));
+        assert_eq!(search.advance(&g,0,&|_,_|false,&mut |_,_|Some(0.0)),SearchStatus::Pending);assert_eq!(search.expanded,0);
+        let mut slices=0;while search.status==SearchStatus::Pending {let before=search.expanded;
+            search.advance(&g,7,&|_,_|false,&mut |_,b|Some(if b.y==13 {2.0}else{0.0}));assert!(search.expanded-before<=7);slices+=1;assert!(slices<1000);}
+        assert_eq!(search.status,SearchStatus::Found);assert!(slices>1);assert_eq!(search.cells.first(),Some(&Cell::new(3,5)));assert_eq!(search.cells.last(),Some(&Cell::new(20,5)));
+        for e in search.cells.windows(2) {assert!(step_cost(&g,e[0],e[1]).is_some());}assert!(search.cells.iter().any(|c|c.y>=13));
+    }
+    #[test]
+    fn only_exhausting_the_open_set_reports_no_path() {
+        let mut g=CostGrid{w:12,h:12,cost:vec![1;144],..Default::default()};for y in 0..12 {g.cost[y*12+6]=0;}
+        let mut s=PathSearch::new(&g,Cell::new(2,5),Cell::new(9,5));
+        assert_eq!(s.advance(&g,1,&|_,_|false,&mut |_,_|Some(0.0)),SearchStatus::Pending);
+        while s.status==SearchStatus::Pending {s.advance(&g,8,&|_,_|false,&mut |_,_|Some(0.0));}
+        assert_eq!(s.status,SearchStatus::NoPath);assert!(s.cells.is_empty());
+    }
 }
 
 // ============================================================================ 流场求解
@@ -440,7 +482,9 @@ fn write_directions(g: &CostGrid, out: &mut FlowField) {
                 let ny = y + K_DIR_Y[d];
                 let Some(edge)=step_cost(g,Cell::new(x,y),Cell::new(nx,ny)) else {continue;};
                 let v=out.dist[idx(nx,ny)]+edge;
-                if v < best {
+                let diagonal=K_DIR_X[d]!=0&&K_DIR_Y[d]!=0;
+                let chosen_diagonal=bx!=0&&by!=0;
+                if v < best || (v==best&&diagonal&&!chosen_diagonal) {
                     best = v;
                     bx = K_DIR_X[d];
                     by = K_DIR_Y[d];
@@ -1435,6 +1479,16 @@ pub fn find_path_hierarchical(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn equal_cost_flow_prefers_earlier_diagonal_progress() {
+        let g=CostGrid{w:4,h:4,cost:vec![1;16],..Default::default()};let mut field=FlowField::default();
+        assert!(compute_flow_field_cpu_multi(&g,&[Cell::new(2,2)],&mut field));
+        let from=Cell::new(0,1);let next=flow_step(&g,&field,from).unwrap();
+        assert_eq!(next,Cell::new(1,2),"an equal-cost turn was deferred until the last column");
+        let score=step_cost(&g,from,next).unwrap()+field.dist_at(next.x,next.y);
+        assert!((score-field.dist_at(from.x,from.y)).abs()<1e-5);
+        assert_eq!(flow_step(&g,&field,Cell::new(2,2)),None);
+    }
 
     /// `row[y]` 的第 x 个字符：`.` = 可走(1)，其它 = 不可走(0)。
     fn grid_of(rows: &[&str]) -> CostGrid {

@@ -3,6 +3,9 @@ mod compress;
 mod costgrid;
 mod crowd;
 mod orca;
+mod orca_obstacles;
+mod traffic;
+mod recovery;
 mod arrival;
 mod formation;
 mod collision;
@@ -40,6 +43,8 @@ mod world;
 
 #[cfg(test)]
 mod simulation_tests;
+#[cfg(test)]
+mod orca_integration_tests;
 #[cfg(test)]
 mod nav_properties;
 

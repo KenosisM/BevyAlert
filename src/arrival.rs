@@ -10,11 +10,11 @@ pub const HOLD_SECONDS:f64=0.5;
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
 pub enum CommandStatus {#[default] Idle,Accepted,Active,Completed,Cancelled,Failed}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub enum WaitReason {Stopped,Space,Entrance,LocalPath}
+pub enum WaitReason {Stopped,Space,Entrance,LocalPath,Search}
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
 pub enum Motion {#[default] Idle,Moving,Arriving,Waiting(WaitReason),Replanning,Settled,Cancelled,Failed}
 impl Motion {
-    pub fn tag(self)->u32 {match self {Self::Idle=>0,Self::Moving=>1,Self::Arriving=>2,Self::Waiting(r)=>3+r as u32,
+    pub fn tag(self)->u32 {match self {Self::Idle=>0,Self::Moving=>1,Self::Arriving=>2,Self::Waiting(WaitReason::Search)=>11,Self::Waiting(r)=>3+r as u32,
         Self::Replanning=>7,Self::Settled=>8,Self::Cancelled=>9,Self::Failed=>10}}
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -58,6 +58,7 @@ impl Arrival {
             self.quiet_seconds=0.0;self.motion=match b {
                 TargetBlock::Entrance=>Motion::Waiting(WaitReason::Entrance),
                 TargetBlock::NoLocalPath=>Motion::Waiting(WaitReason::LocalPath),
+                TargetBlock::SearchBudget=>Motion::Waiting(WaitReason::Search),
                 TargetBlock::InvalidPosition|TargetBlock::OccupiedPosition=>Motion::Replanning,
             };
         }else if matches!(self.motion,Motion::Waiting(_)|Motion::Replanning) {self.motion=Motion::Moving;}
@@ -67,7 +68,7 @@ impl Arrival {
     pub fn preferred_speed(&mut self,target:&Target,remaining:f32,max_speed:f32,brake:f32,dt:f32)->f32 {
         if self.held() {return 0.0;}
         self.set_block(target.blocked);
-        if !target.valid||!remaining.is_finite()||matches!(self.motion,Motion::Waiting(WaitReason::LocalPath|WaitReason::Space)) {return 0.0;}
+        if !target.valid||!remaining.is_finite()||matches!(self.motion,Motion::Waiting(WaitReason::LocalPath|WaitReason::Space|WaitReason::Search)) {return 0.0;}
         let max_speed=max_speed.max(0.0);let brake=brake.max(0.001);let dt=dt.max(1e-6);
         let start=(max_speed*max_speed/(2.0*brake)+0.3).max(1.0);
         if !matches!(self.motion,Motion::Waiting(_)) {
@@ -176,6 +177,11 @@ mod tests {
                 if w.query::<&Unit>().iter(&w).all(|u|u.arrival.settled()) {break;}
             }
             let mut units:Vec<_>=w.query::<(Entity,&Unit)>().iter(&w).map(|(e,u)|(e,u.idx,formation::position(u))).collect();units.sort_by_key(|u|u.1);
+            if !w.query::<&Unit>().iter(&w).all(|u|u.arrival.settled()) {
+                for u in w.query::<&Unit>().iter(&w).filter(|u|!u.arrival.settled()).take(12) {
+                    println!("incomplete id={} position=({},{}) velocity=({},{}) preferred={:?} target={:?}",u.idx,u.cell_x,u.cell_y,u.vx,u.vy,u.preferred_velocity,u.parking);
+                }
+            }
             assert!(w.query::<&Unit>().iter(&w).all(|u|u.arrival.settled()),"count={count} did not finish by tick {tick}");
             assert_eq!(w.resource::<SimEnv>().reservations.claims.len(),count);
             let mut max_drift=0.0f32;

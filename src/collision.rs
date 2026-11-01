@@ -1,5 +1,5 @@
 //! Conservative disc motion on the navigation grid. No cached copy of terrain geometry.
-use bevy::math::Vec2;
+use bevy::math::{DVec2,Vec2};
 use crate::{crowd::Agent, nav::{self, CostGrid}};
 use crate::spatial::{Aabb,Index};
 
@@ -38,18 +38,23 @@ pub struct ContactReport {
 
 fn pos(a: &Agent) -> Vec2 { Vec2::new(a.x,a.y) }
 fn set(a: &mut Agent,p: Vec2) { a.x=p.x; a.y=p.y; }
+fn initially_overlapping(a:&Agent,b:&Agent)->bool {
+    (pos(a).as_dvec2()-pos(b).as_dvec2()).length()+f64::from(EPS)<f64::from(a.radius)+f64::from(b.radius)
+}
 
 /// Exact circle/square clearance, including the outside of the map.
 pub fn disc_clear(g: &CostGrid,p: Vec2,r: f32) -> bool {
+    // Accepting an inset tolerance can leave a start that the next sweep rejects.
+    let (px,py,rd)=(f64::from(p.x),f64::from(p.y),f64::from(r));
     if !g.valid() || !p.is_finite() || !r.is_finite() || r<0.0
-        || p.x-r < -0.5-EPS || p.y-r < -0.5-EPS
-        || p.x+r > g.w as f32-0.5+EPS || p.y+r > g.h as f32-0.5+EPS {return false;}
+        || px-rd < -0.5 || py-rd < -0.5
+        || px+rd > g.w as f64-0.5 || py+rd > g.h as f64-0.5 {return false;}
     let (x0,x1)=(((p.x-r-0.5).floor() as i32).max(0),((p.x+r+0.5).ceil() as i32).min(g.w-1));
     let (y0,y1)=(((p.y-r-0.5).floor() as i32).max(0),((p.y+r+0.5).ceil() as i32).min(g.h-1));
     for y in y0..=y1 { for x in x0..=x1 {
         if g.walkable(x,y) {continue;}
         let near=p.clamp(Vec2::new(x as f32-0.5,y as f32-0.5),Vec2::new(x as f32+0.5,y as f32+0.5));
-        if p.distance_squared(near)<(r-EPS).max(0.0).powi(2) || (r==0.0 && p==near) {return false;}
+        if (p.as_dvec2()-near.as_dvec2()).length_squared()<(r as f64).powi(2) || (r==0.0 && p==near) {return false;}
     }}
     true
 }
@@ -62,7 +67,7 @@ fn first_hit(g: &CostGrid,p: Vec2,d: Vec2,r: f32) -> Option<Hit> {
     if d.length_squared()<1e-16 {return None;}
     let mut hit: Option<Hit>=None;
     let mut add=|t:f32,n:Vec2| {
-        if t>=-EPS && t<=1.0 && d.dot(n)< -EPS && hit.is_none_or(|h|t<h.t) {
+        if t>=-EPS && t<=1.0 && d.dot(n)<0.0 && hit.is_none_or(|h|t<h.t) {
             hit=Some(Hit{t:t.max(0.0),normal:n});
         }
     };
@@ -100,7 +105,10 @@ fn first_hit(g: &CostGrid,p: Vec2,d: Vec2,r: f32) -> Option<Hit> {
 
 /// Relative segment time of impact. Double precision avoids cancellation at long displacements.
 fn circle_toi(q:Vec2,d:Vec2,r:f32)->Option<f32> {
-    let (qx,qy,dx,dy,r)=(q.x as f64,q.y as f64,d.x as f64,d.y as f64,r as f64);
+    circle_toi_f64(q.as_dvec2(),d.as_dvec2(),r as f64)
+}
+fn circle_toi_f64(q:DVec2,d:DVec2,r:f64)->Option<f32> {
+    let (qx,qy,dx,dy)=(q.x,q.y,d.x,d.y);
     let a=dx*dx+dy*dy;let b=qx*dx+qy*dy;let c=qx*qx+qy*qy-r*r;
     if a<1e-20 || b>=0.0 {return None;}
     if c<=0.0 {return Some(0.0);}
@@ -114,14 +122,15 @@ fn clip(g:&CostGrid,from:Vec2,to:Vec2,r:f32)->Vec2 {
     let d=to-from;
     let t=first_hit(g,from,d,r).map_or(1.0,|h|(h.t-CONTACT_GAP/d.length().max(CONTACT_GAP)).max(0.0));
     let candidate=from+d*t;
-    if nav::segment_allowed(g,(from.x,from.y),(candidate.x,candidate.y)) && disc_clear(g,candidate,r) {return candidate;}
+    if disc_segment_clear(g,from,candidate,r) {return candidate;}
     // Navigation's stricter no-cut rule can also reject an otherwise clear circle segment.
     let (mut lo,mut hi)=(0.0,t);
     for _ in 0..24 {
         let m=(lo+hi)*0.5;let p=from+d*m;
-        if nav::segment_allowed(g,(from.x,from.y),(p.x,p.y)) && disc_clear(g,p,r) {lo=m;}else{hi=m;}
+        if disc_segment_clear(g,from,p,r) {lo=m;}else{hi=m;}
     }
-    from+d*(lo-CONTACT_GAP/d.length().max(CONTACT_GAP)).max(0.0)
+    let candidate=from+d*(lo-CONTACT_GAP/d.length().max(CONTACT_GAP)).max(0.0);
+    if disc_segment_clear(g,from,candidate,r) {candidate}else{from}
 }
 
 pub fn disc_segment_clear(g:&CostGrid,from:Vec2,to:Vec2,r:f32)->bool {
@@ -169,7 +178,7 @@ fn project_contacts_with_workspace(agents:&mut [Agent],g:&CostGrid,iterations:u3
             while cursor<w.neighbors.len() {
             let j=w.neighbors[cursor];cursor+=1;if j<=after {continue;}after=j;
             if let Some(old)=initial {
-                if pos(&old[i]).distance(pos(&old[j]))+EPS>=old[i].radius+old[j].radius {continue;}
+                if !initially_overlapping(&old[i],&old[j]) {continue;}
                 w.recovery[i]=true;w.recovery[j]=true;
             }
             let (pi,pj)=(pos(&agents[i]),pos(&agents[j]));let q=pj-pi;let dist=q.length();
@@ -200,13 +209,15 @@ fn project_contacts_with_workspace(agents:&mut [Agent],g:&CostGrid,iterations:u3
 }
 
 fn pair_toi(old:&[Agent],next:&[Agent],i:usize,j:usize)->Option<f32> {
-    let q=pos(&old[j])-pos(&old[i]);let r=old[i].radius+old[j].radius;
+    // Widen positions before subtracting: this tick and the next must measure
+    // the same published endpoints without float cancellation at map scale.
+    let q=pos(&old[j]).as_dvec2()-pos(&old[i]).as_dvec2();let r=old[i].radius as f64+old[j].radius as f64;
     // Initial penetrations require recovery, not an impossible claim of safe past motion.
-    if q.length()+EPS<r {return None;}
-    let d=(pos(&next[j])-pos(&old[j]))-(pos(&next[i])-pos(&old[i]));
+    if q.length()+f64::from(EPS)<r {return None;}
+    let d=(pos(&next[j]).as_dvec2()-pos(&old[j]).as_dvec2())-(pos(&next[i]).as_dvec2()-pos(&old[i]).as_dvec2());
     let t=(-q.dot(d)/d.length_squared().max(1e-20)).clamp(0.0,1.0);
-    if (q+d*t).length()+EPS>=r {return None;}
-    circle_toi(q,d,r)
+    if (q+d*t).length()+f64::from(EPS)>=r {return None;}
+    circle_toi_f64(q,d,r)
 }
 
 /// Complete the proposed tick before committing any position. All published trajectories
@@ -258,7 +269,7 @@ pub fn finish_motion_with_workspace(old:&[Agent],next:&mut [Agent],g:&CostGrid,w
                 let bound=|k:usize,candidate:Vec2| {
                     let delta=candidate-pos(&old[k]);let cap=w.before_projection[k].distance(pos(&old[k]));
                     let candidate=if !w.recovery[k]&&delta.length()>cap {pos(&old[k])+delta.normalize_or_zero()*cap}else{candidate};
-                    clip(g,pos(&old[k]),candidate,old[k].radius)
+                    move_disc(g,pos(&old[k]),candidate,old[k].radius).0
                 };
                 let pi=bound(i,pos(&old[i])+di+n*(correction*wi));
                 let pj=bound(j,pos(&old[j])+dj-n*(correction*wj));
@@ -285,12 +296,12 @@ pub fn finish_motion_with_workspace(old:&[Agent],next:&mut [Agent],g:&CostGrid,w
         }
     }
     for &(i,j) in &w.pairs {
-        let q=pos(&old[j])-pos(&old[i]);let r=old[i].radius+old[j].radius;
-        if q.length()+EPS<r {report.initial_overlaps+=1;}
+        let q=pos(&old[j]).as_dvec2()-pos(&old[i]).as_dvec2();let r=old[i].radius as f64+old[j].radius as f64;
+        if initially_overlapping(&old[i],&old[j]) {report.initial_overlaps+=1;}
         else {
-            let d=(pos(&next[j])-pos(&old[j]))-(pos(&next[i])-pos(&old[i]));
+            let d=(pos(&next[j]).as_dvec2()-pos(&old[j]).as_dvec2())-(pos(&next[i]).as_dvec2()-pos(&old[i]).as_dvec2());
             let t=(-q.dot(d)/d.length_squared().max(1e-20)).clamp(0.0,1.0);
-            report.max_swept_penetration=report.max_swept_penetration.max((r-(q+d*t).length()).max(0.0));
+            report.max_swept_penetration=report.max_swept_penetration.max((r-(q+d*t).length()).max(0.0) as f32);
         }
         let penetration=(next[i].radius+next[j].radius-pos(&next[i]).distance(pos(&next[j]))).max(0.0);
         report.max_penetration=report.max_penetration.max(penetration);
@@ -312,6 +323,33 @@ mod tests {
     use super::*;
     fn grid(w:i32,h:i32)->CostGrid {CostGrid{w,h,cost:vec![1;(w*h) as usize],..Default::default()}}
     fn agent(x:f32,y:f32)->Agent {Agent{x,y,..Default::default()}}
+    #[test]
+    fn small_inward_steps_cannot_accumulate_wall_overlap() {
+        let mut g=grid(192,160);for y in 0..g.h {for x in 78..=90 {g.cost[(y*g.w+x) as usize]=0;}}
+        let mut old=vec![Agent{x:77.04999542236328,y:70.0,radius:0.45,..Default::default()}];
+        for _ in 0..96 {
+            let mut next=old.clone();next[0].x+=0.000008;next[0].y+=0.125;
+            let report=finish_motion(&old,&mut next,&g);
+            assert!(f64::from(next[0].x)+f64::from(next[0].radius)<=77.5);
+            assert_eq!(report.illegal_static_trajectories,0);assert_eq!(report.initial_overlaps,0);
+            old=next;
+        }
+        assert!(old[0].y>70.5,"legal tangential progress was stopped");
+    }
+    #[test]
+    fn large_coordinates_do_not_hide_next_tick_pair_penetration() {
+        let g=grid(192,160);
+        let a=Agent{x:97.9861068725586,y:74.94999694824219,radius:0.45,..Default::default()};
+        let b=Agent{x:97.08616638183594,y:74.95943450927734,radius:0.45,..Default::default()};
+        let mut old=vec![a.clone(),b.clone()];let n=(pos(&b)-pos(&a)).normalize();
+        set(&mut old[1],pos(&b)+n*0.0001);let mut next=vec![a,b];
+        let report=finish_motion(&old,&mut next,&g);
+        let radius=f64::from(old[0].radius)+f64::from(old[1].radius);
+        assert!(swept_distance(&old[0],&old[1],&next[0],&next[1])+f64::from(EPS)>=radius);
+        assert_eq!(report.initial_overlaps,0);assert_eq!(report.illegal_static_trajectories,0);
+        let mut held=next.clone();let held_report=finish_motion(&next,&mut held,&g);
+        assert_eq!(held_report.initial_overlaps,0);assert_eq!(held_report.unresolved_pairs,0);
+    }
     // Independent distance from a moving point to a fixed point, in f64.
     fn swept_distance(a:&Agent,b:&Agent,na:&Agent,nb:&Agent)->f64 {
         let q=(b.x as f64-a.x as f64,b.y as f64-a.y as f64);
@@ -453,7 +491,7 @@ mod tests {
         }
     }
     #[test]
-    fn formal_simulation_keeps_the_reason_for_a_wall_limited_velocity_proposal() {
+    fn formal_simulation_predicts_a_wall_and_retains_contact_fallback_diagnostics() {
         use crate::{simulation,world::{SimEnv,Unit},nav::Cell};
         let mut g=grid(20,20);for y in 0..20 {g.cost[y*20+8]=0;}
         let mut env=SimEnv{nav:g,..Default::default()};
@@ -461,8 +499,9 @@ mod tests {
         let mut reported=false;
         for _ in 0..20 {
             simulation::step_continuous(&mut env,&mut units);
-            reported |= env.runtime.contacts.reasons[0]==Blocked::StaticBoundary;
+            reported |= env.runtime.orca.static_constraints>0;
             assert_eq!(env.runtime.contacts.illegal_static_trajectories,0);
+            assert_eq!(env.runtime.orca.contact_fallback,0);
         }
         assert!(reported);assert!(units[0].cell_x<7.05001);assert_eq!(units[0].goal,Cell::new(15,10));
     }
